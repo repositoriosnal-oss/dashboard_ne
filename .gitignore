@@ -1,0 +1,15 @@
+# Entornos virtuales de Python
+env/
+venv/
+.venv/
+
+# Archivos de caché de Python
+__pycache__/
+*.pyc
+
+# 🛡️ SEGURIDAD CRÍTICA: Evitar que las contraseñas de Streamlit se suban a Git
+.streamlit/secrets.toml
+
+# Archivos de sistema basura (específicos de Windows/Mac)
+.DS_Store
+Thumbs.db
