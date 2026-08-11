@@ -20,7 +20,8 @@ def ejecutar_sincronizacion_desde_sap():
         query_remisiones = """
             SELECT T0."DocNum" as "Documento", T0."CardName" as "Cliente", T0."DocDate" as "Fecha_Contabilizacion", 
             T0."DocStatus" as "Status_Documento", T0."SlpCode" as "Empleado_Ventas", T0."OwnerCode" as "Propietario_Doc",
-            T0."Branch" as "Sede_Codigo", T1."ItemCode" as "Numero_Articulo", T1."Dscription" as "Descripcion", 
+            T2."WhsName" as "Sede_Codigo",
+            T1."ItemCode" as "Numero_Articulo", T1."Dscription" as "Descripcion", 
             T1."Quantity" as "Cantidad", T1."Price" as "Precio", T1."LineTotal" AS "Precio_Sin_IVA", 
             T1."LineTotal" + T1."VatSum" AS "Precio_Total", T2."WhsName" as "Almacen", T3."U_NAME" as "Nombre_Usuario",
             T5."ItmsGrpNam" as "Linea", T6."FirmName" AS "Marca",
@@ -48,7 +49,7 @@ def ejecutar_sincronizacion_desde_sap():
                 T0."DocStatus" as "Status_Documento", 
                 T0."SlpCode" as "Empleado_Ventas", 
                 T0."OwnerCode" as "Propietario_Doc",
-                T0."Branch" as "Sede_Codigo", 
+                T2."WhsName" as "Sede_Codigo", 
                 T1."ItemCode" as "Numero_Articulo", 
                 T1."Dscription" as "Descripcion", 
                 T1."Quantity" as "Cantidad", 
@@ -73,7 +74,7 @@ def ejecutar_sincronizacion_desde_sap():
         query_ordenes = """
             SELECT T0."DocNum" as "Documento", T0."CardCode" as "Numero_Cliente", T0."CardName" as "Cliente", T0."DocDate" as "Fecha_Contabilizacion", 
             T0."DocStatus" as "Status_Documento", T0."SlpCode" as "Empleado_Ventas", T0."OwnerCode" as "Propietario_Doc",
-            T0."Branch" as "Sede_Codigo", T1."ItemCode" as "Numero_Articulo", T1."Dscription" as "Descripcion", 
+            T2."WhsName" as "Sede_Codigo", T1."ItemCode" as "Numero_Articulo", T1."Dscription" as "Descripcion", 
             T1."Quantity" as "Cantidad", T1."Price" as "Precio", T1."LineTotal" AS "Precio_Sin_IVA", 
             T1."LineTotal" + T1."VatSum" AS "Precio_Total", T2."WhsName" as "Almacen", T3."U_NAME" as "Nombre_Usuario",
             COALESCE(NULLIF(TRIM(T4."firstName" || ' ' || T4."lastName"), ''), T3."U_NAME") as "Colaborador"
@@ -88,7 +89,7 @@ def ejecutar_sincronizacion_desde_sap():
             SELECT 
             T0."DocNum" as "Documento", T0."Comments" as "Observaciones", T0."DocDate" as "Fecha_Contabilizacion", 
             T0."DocStatus" as "Status_Documento", T0."SlpCode" as "Empleado_Ventas", T0."OwnerCode" as "Propietario_Doc",
-            T0."Branch" as "Sede_Codigo", 
+            T2."WhsName" as "Sede_Codigo", 
             T1."ItemCode" as "Numero_Articulo", T1."Dscription" as "Descripcion", 
             T1."Quantity" as "Cantidad", T1."Price" as "Precio", 
             T1."LineTotal" AS "Precio_Sin_IVA", T1."LineTotal" + T1."VatSum" AS "Precio_Total",
@@ -109,6 +110,7 @@ def ejecutar_sincronizacion_desde_sap():
                 T0."DocDate" as "Fecha_Contabilizacion", 
                 T0."DocStatus" as "Status_Documento", 
                 T0."OwnerCode" as "Propietario_Doc",
+                T2."WhsName" as "Sede_Codigo",
                 T1."ItemCode" as "Numero_Articulo", T1."Dscription" as "Descripcion", 
                 T1."Quantity" as "Cantidad", T1."Price" as "Precio", 
                 T1."LineTotal" AS "Precio_Sin_IVA", T1."LineTotal" + T1."VatSum" AS "Precio_Total",
@@ -127,7 +129,7 @@ def ejecutar_sincronizacion_desde_sap():
         query_facturas = """
             SELECT T0."DocNum" as "Documento", T0."CardCode" as "Numero_Cliente", T0."CardName" as "Cliente", T0."DocDate" as "Fecha_Contabilizacion", 
             T0."DocStatus" as "Status_Documento", T0."SlpCode" as "Empleado_Ventas", T0."OwnerCode" as "Propietario_Doc",
-            T0."Branch" as "Sede_Codigo", T1."ItemCode" as "Numero_Articulo", T1."Dscription" as "Descripcion", 
+            T2."WhsName" as "Sede_Codigo", T1."ItemCode" as "Numero_Articulo", T1."Dscription" as "Descripcion", 
             T1."Quantity" as "Cantidad", T1."Price" as "Precio", T1."LineTotal" AS "Precio_Sin_IVA", 
             T1."LineTotal" + T1."VatSum" AS "Precio_Total", T2."WhsName" as "Almacen", T3."U_NAME" as "Nombre_Usuario",
             COALESCE(NULLIF(TRIM(T4."firstName" || ' ' || T4."lastName"), ''), T3."U_NAME") as "Colaborador"
@@ -143,7 +145,7 @@ def ejecutar_sincronizacion_desde_sap():
         query_notas = """
             SELECT T0."DocNum" as "Documento", T0."CardCode" as "Numero_Cliente", T0."CardName" as "Cliente", T0."DocDate" as "Fecha_Contabilizacion", 
             T0."DocStatus" as "Status_Documento", T0."SlpCode" as "Empleado_Ventas", T0."OwnerCode" as "Propietario_Doc",
-            T0."Branch" as "Sede_Codigo", T1."ItemCode" as "Numero_Articulo", T1."Dscription" as "Descripcion", 
+            T2."WhsName" as "Sede_Codigo", T1."ItemCode" as "Numero_Articulo", T1."Dscription" as "Descripcion", 
             T1."Quantity" as "Cantidad", T1."Price" as "Precio", T1."LineTotal" AS "Precio_Sin_IVA", 
             T1."LineTotal" + T1."VatSum" AS "Precio_Total", T2."WhsName" as "Almacen", T3."U_NAME" as "Nombre_Usuario",
             COALESCE(NULLIF(TRIM(T4."firstName" || ' ' || T4."lastName"), ''), T3."U_NAME") as "Colaborador"
@@ -237,8 +239,15 @@ def aplicar_seguridad_rls(df):
     if 'Sede_Codigo' in df_filtrado.columns: df_filtrado['Sede_Codigo'] = df_filtrado['Sede_Codigo'].astype(str).str.strip()
     if rol in ["admin", "gerente", "gerente_comercial"]: return df_filtrado
     elif rol == "admin_punto":
-        sap_branch = str(st.session_state.get('sap_branch_code', '')).strip()
-        if sap_branch and 'Sede_Codigo' in df_filtrado.columns: return df_filtrado[df_filtrado['Sede_Codigo'] == sap_branch]
+        sap_branch = st.session_state.get('sap_branch_code')
+        # Validamos que no sea None, ni vacío, ni la cadena de texto "None"
+        if sap_branch and str(sap_branch).strip().lower() not in ['none', '']:
+            sap_branch = str(sap_branch).strip().upper()
+            if 'Sede_Codigo' in df_filtrado.columns:
+                # Comparamos en mayúsculas para evitar errores de tipeo
+                return df_filtrado[df_filtrado['Sede_Codigo'].str.upper() == sap_branch]
+        # Si no tiene un branch code válido, no mostramos nada (seguridad por defecto)
+        return df_filtrado.iloc[0:0]
     elif rol == "comercial":
         sap_owner = str(st.session_state.get('sap_owner_code', '')).strip()
         sap_slp = str(st.session_state.get('sap_slp_code', '')).strip()

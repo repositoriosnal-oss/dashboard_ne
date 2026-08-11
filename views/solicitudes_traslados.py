@@ -91,7 +91,8 @@ rol = st.session_state.get('rol_actual', 'comercial')
 usuario_logueado = st.session_state.get('usuario_actual', 'Usuario')
 
 st.title("SOLICITUDES DE TRASLADO ABIERTAS")
-if rol in ["admin", "gerente", "gerente_comercial"]:
+# ✅ CAMBIO 1: Agregado "admin_punto" al mensaje de bienvenida
+if rol in ["admin", "gerente", "gerente_comercial", "admin_punto"]:
     st.success("Vista general corporativa")
 else:
     st.info(f"Viendo únicamente tus traslados asignados")
@@ -196,8 +197,9 @@ with tab_analitica:
         # ==========================================
         # LAYOUT CONDICIONAL SEGÚN EL ROL
         # ==========================================
-        if rol in ["admin", "gerente", "gerente_comercial"]:
-            # --- LAYOUT GERENCIAL (2 Columnas) ---
+        # ✅ CAMBIO 2: Agregado "admin_punto" para que vea los gráficos principales de desglose
+        if rol in ["admin", "gerente", "gerente_comercial", "admin_punto"]:
+            # --- LAYOUT GERENCIAL / ADMIN PUNTO (2 Columnas) ---
             col_izq, col_der = st.columns([1.2, 1])
             
             with col_izq:
@@ -303,7 +305,8 @@ with tab_analitica:
         # ==========================================
         # SECCIÓN INFERIOR (Solicitante y Resumen Almacén)
         # ==========================================
-        if rol in ["admin", "gerente", "gerente_comercial"]:
+        # ✅ CAMBIO 3: Agregado "admin_punto" para que vea los gráficos inferiores de desglose
+        if rol in ["admin", "gerente", "gerente_comercial", "admin_punto"]:
             col_g4, col_g5 = st.columns([1.6, 1])
 
             with col_g4:
@@ -353,18 +356,16 @@ with tab_analitica:
             st.metric("Valor Promedio", value=f"${promedio:,.2f}")
 
         # ==========================================
-        # 6. DETALLE EN DESPLEGABLE (Con N° Cliente y Cliente agregados)
+        # 6. DETALLE EN DESPLEGABLE (Limpio, sin columnas de cliente)
         # ==========================================
         with st.expander("Ver Detalle de traslados abiertos", expanded=False):
-            # ✅ Se agregaron 'Numero_Cliente' y 'Cliente'
-            columnas_mostrar = ['Documento', 'Numero_Cliente', 'Cliente', 'Observaciones', 'Almacen_Origen_Corto', 'Almacen_Corto', 'Fecha_Texto', 'Dias', 'Rango_Dias', 'Colaborador', 'Precio_Sin_IVA', 'Precio_Total']
+            # ✅ CORRECCIÓN: Eliminadas 'Numero_Cliente' y 'Cliente' ya que los traslados son internos
+            columnas_mostrar = ['Documento', 'Observaciones', 'Almacen_Origen_Corto', 'Almacen_Corto', 'Fecha_Texto', 'Dias', 'Rango_Dias', 'Colaborador', 'Precio_Sin_IVA', 'Precio_Total']
             columnas_existentes = [col for col in columnas_mostrar if col in df_filtrado.columns]
             df_tabla = df_filtrado[columnas_existentes].copy()
             
             rename_dict = {
                 'Documento': 'Documento', 
-                'Numero_Cliente': 'N° Cliente', # ✅ Agregado
-                'Cliente': 'Cliente',           # ✅ Agregado
                 'Observaciones': 'Observación', 
                 'Almacen_Origen_Corto': 'Origen', 
                 'Almacen_Corto': 'Destino', 

@@ -92,7 +92,8 @@ rol = st.session_state.get('rol_actual', 'comercial')
 usuario_logueado = st.session_state.get('usuario_actual', 'Usuario')
 
 st.title("SOLICITUDES DE COMPRA ABIERTAS")
-if rol in ["admin", "gerente", "gerente_comercial"]:
+# ✅ CAMBIO 1: Agregado "admin_punto" al mensaje de bienvenida
+if rol in ["admin", "gerente", "gerente_comercial", "admin_punto"]:
     st.success("Vista general corporativa")
 else:
     st.info(f"Viendo únicamente tus solicitudes asignadas")
@@ -196,8 +197,9 @@ with tab_analitica:
         # ==========================================
         # LAYOUT CONDICIONAL SEGÚN EL ROL
         # ==========================================
-        if rol in ["admin", "gerente", "gerente_comercial"]:
-            # --- LAYOUT GERENCIAL (2 Columnas) ---
+        # ✅ CAMBIO 2: Agregado "admin_punto" para que vea los gráficos principales de desglose
+        if rol in ["admin", "gerente", "gerente_comercial", "admin_punto"]:
+            # --- LAYOUT GERENCIAL / ADMIN PUNTO (2 Columnas) ---
             col_izq, col_der = st.columns([1.2, 1])
             
             with col_izq:
@@ -303,7 +305,8 @@ with tab_analitica:
         # ==========================================
         # SECCIÓN INFERIOR (Solicitante y Resumen Almacén)
         # ==========================================
-        if rol in ["admin", "gerente", "gerente_comercial"]:
+        # ✅ CAMBIO 3: Agregado "admin_punto" para que vea los gráficos inferiores de desglose
+        if rol in ["admin", "gerente", "gerente_comercial", "admin_punto"]:
             col_g4, col_g5 = st.columns([1.6, 1])
 
             with col_g4:

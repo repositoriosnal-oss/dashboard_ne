@@ -90,10 +90,32 @@ rol = st.session_state.get('rol_actual', 'comercial')
 usuario_logueado = st.session_state.get('usuario_actual', 'Usuario')
 
 st.title("REMISIONES ABIERTAS")
-if rol in ["admin", "gerente", "gerente_comercial"]:
+# ✅ 1. Agregado admin_punto aquí para el mensaje de bienvenida
+if rol in ["admin", "gerente", "gerente_comercial", "admin_punto"]:
     st.success("Vista general corporativa")
 else:
     st.info(f"Viendo únicamente tus remisiones asignadas")
+
+# Borrar desde aqui -----------------------------------------------------------------------------------------------------------------
+
+# ==========================================
+# 2. BLOQUE DE DIAGNÓSTICO (Colocar AQUÍ, después de definir 'rol')
+# ==========================================
+#if rol == "admin_punto":
+#    st.warning("🔍 **MODO DIAGNÓSTICO ACTIVADO**")
+#    st.write("1. Rol detectado:", rol)
+#    st.write("2. sap_branch_code en la sesión:", f"'{st.session_state.get('sap_branch_code')}'")
+#    
+#    if not df_completo.empty and 'Sede_Codigo' in df_completo.columns:
+#        unicos_bd = df_completo['Sede_Codigo'].dropna().astype(str).str.strip().unique().tolist()
+#        st.write("3. Valores reales de 'Sede_Codigo' en la BD (ejemplos):", unicos_bd[:10])
+#    
+#    st.write("4. ¿El DataFrame filtrado (df_seguro) está vacío?", df_seguro.empty)
+#    if not df_seguro.empty:
+#        st.write("5. Cantidad de filas después del filtro:", len(df_seguro))
+#    st.markdown("---")
+
+# Borrar hasta aqui------------------------------------------------------------------------------------------------------------------
 
 # ==========================================
 # 1. INICIALIZAR FILTROS DINÁMICOS EN SESSION_STATE
@@ -115,6 +137,7 @@ with st.sidebar:
     iva_seleccionado = st.multiselect("Estado IVA:", options=iva_opciones, default=iva_opciones, key="sb_iva_rem")
     
     colaboradores_seleccionados = []
+    # ✅ 2. Agregado admin_punto aquí para que pueda ver el filtro de colaboradores
     if rol in ["admin", "gerente", "gerente_comercial", "admin_punto"]:
         df_temp = df_seguro[df_seguro['Almacen_Corto'].isin(almacenes_seleccionados)] if almacenes_seleccionados else df_seguro
         colab_opciones = sorted(df_temp['Colaborador'].dropna().unique().tolist())
@@ -180,12 +203,11 @@ with tab_analitica:
     if df_seguro.empty or df_filtrado.empty:
         st.warning("No hay datos con los filtros actuales.")
     else:
-        # ✅ 1. CALCULAR MÉTRICAS BASE PRIMERO (Para evitar NameError en bloques condicionales)
+        # ✅ CALCULAR MÉTRICAS BASE PRIMERO (Para evitar NameError)
         total_docs = df_filtrado['Documento'].nunique()
         total_con_iva = df_filtrado['Precio_Total'].sum()
         total_sin_iva = df_filtrado['Precio_Sin_IVA'].sum()
 
-        # 2. Placeholders para KPIs
         kpi_cols = st.columns(3)
         kpi_ph1 = kpi_cols[0].empty()
         kpi_ph2 = kpi_cols[1].empty()
@@ -194,8 +216,9 @@ with tab_analitica:
         # ==========================================
         # LAYOUT CONDICIONAL SEGÚN EL ROL
         # ==========================================
-        if rol in ["admin", "gerente", "gerente_comercial"]:
-            # --- LAYOUT GERENCIAL (2 Columnas) ---
+        # ✅ 3. AGREGADO "admin_punto" AQUÍ
+        if rol in ["admin", "gerente", "gerente_comercial", "admin_punto"]:
+            # --- LAYOUT GERENCIAL / ADMIN PUNTO (2 Columnas) ---
             col_izq, col_der = st.columns([1.3, 1])
 
             with col_izq:
@@ -301,7 +324,8 @@ with tab_analitica:
         # ==========================================
         # SECCIÓN INFERIOR (Colaborador y Almacén)
         # ==========================================
-        if rol in ["admin", "gerente", "gerente_comercial"]:
+        # ✅ 4. AGREGADO "admin_punto" AQUÍ TAMBIÉN
+        if rol in ["admin", "gerente", "gerente_comercial", "admin_punto"]:
             col_g4, col_g5 = st.columns([1.6, 1])
 
             with col_g4:
@@ -338,10 +362,10 @@ with tab_analitica:
         else:
             # Mensaje elegante para comerciales en lugar de espacio vacío
             st.markdown("---")
-            st.info("*Despliega la ventana y obtén información de tus remisiones*")
+            st.info("ℹ️ *Despliega la ventana inferior para obtener información detallada de tus remisiones.*")
 
         # ==========================================
-        # 5. RELLENAR KPIs (Visible para todos, usa las variables calculadas al inicio)
+        # 5. RELLENAR KPIs (Visible para todos)
         # ==========================================
         with kpi_ph1.container(border=True, height=90):
             st.metric("Documentos", value=f"{total_docs:,}")
@@ -431,6 +455,7 @@ with tab_gestion:
                     st.dataframe(df_b_filtrado, use_container_width=True, hide_index=True, height=380, column_config={"novedad": st.column_config.TextColumn(width="medium"), "comentario_gerencia": st.column_config.TextColumn(width="medium")}, key="tabla_novedades")
 
         with col_gest_der:
+            # ✅ 5. Aquí ya funcionaba porque decía "not in ['comercial']", lo cual incluye a admin_punto
             if rol not in ["comercial"] and not df_b_filtrado.empty:
                 with st.container(border=True):
                     st.markdown("##### Gestionar novedad")

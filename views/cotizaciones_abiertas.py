@@ -92,7 +92,7 @@ rol = st.session_state.get('rol_actual', 'comercial')
 usuario_logueado = st.session_state.get('usuario_actual', 'Usuario')
 
 st.title("COTIZACIONES ABIERTAS")
-if rol in ["admin", "gerente", "gerente_comercial"]:
+if rol in ["admin", "gerente", "gerente_comercial", "admin_punto"]:
     st.success("Vista general corporativa")
 else:
     st.info(f"Viendo únicamente tus cotizaciones asignadas")
@@ -196,8 +196,9 @@ with tab_analitica:
         # ==========================================
         # LAYOUT CONDICIONAL SEGÚN EL ROL
         # ==========================================
-        if rol in ["admin", "gerente", "gerente_comercial"]:
-            # --- LAYOUT GERENCIAL (2 Columnas) ---
+        # admin_punto SÍ ve los gráficos de desglose (filtrados por su almacén vía RLS)
+        if rol in ["admin", "gerente", "gerente_comercial", "admin_punto"]:
+            # --- LAYOUT GERENCIAL / ADMIN PUNTO (2 Columnas) ---
             col_izq, col_der = st.columns([1.2, 1])
             
             with col_izq:
@@ -303,7 +304,7 @@ with tab_analitica:
         # ==========================================
         # SECCIÓN INFERIOR (Colaborador y Resumen Almacén)
         # ==========================================
-        if rol in ["admin", "gerente", "gerente_comercial"]:
+        if rol in ["admin", "gerente", "gerente_comercial", "admin_punto"]:
             col_g4, col_g5 = st.columns([1.6, 1])
 
             with col_g4:
@@ -333,17 +334,17 @@ with tab_analitica:
                 with st.container(border=True, height=600):
                     st.markdown("##### Cotizaciones por Almacén")
                     
-                    # Evaluamos permisos de visualización
+                    # ✅ CORRECCIÓN: Solo admin, gerente y gerente_comercial ven la Rentabilidad
                     es_admin_o_gerente = rol in ["admin", "gerente", "gerente_comercial"]
                     
-                    # Construimos el diccionario de agregación base
+                    # Construimos el diccionario de agregación base (visible para admin_punto también)
                     agg_dict = {
                         'Cant_Docs': ('Documento', 'nunique'),
                         'Valor_Sin_IVA': ('Precio_Sin_IVA', 'sum'),
                         'Valor_Con_IVA': ('Precio_Total', 'sum')
                     }
                     
-                    # Solo agregamos Rentabilidad si existe en los datos Y el usuario tiene permisos
+                    # Solo agregamos Rentabilidad si existe en los datos Y el usuario tiene permisos de gerencia
                     if 'Rentabilidad' in df_filtrado.columns and es_admin_o_gerente:
                         agg_dict['Rentabilidad'] = ('Rentabilidad', 'sum')
                     
@@ -374,7 +375,7 @@ with tab_analitica:
         else:
             # Mensaje elegante para comerciales en lugar de espacio vacío
             st.markdown("---")
-            st.info("*Despliega la ventana y obtén información de tus cotizaciones*")   # ℹ️ 
+            st.info("ℹ️ *Despliega la ventana inferior para obtener información detallada de tus cotizaciones.*")
 
         # ==========================================
         # 5. RELLENAR KPIs (Visible para todos)
@@ -387,16 +388,16 @@ with tab_analitica:
             st.metric("Valor Promedio", value=f"${promedio:,.2f}")
 
         # ==========================================
-        # 6. DETALLE EN DESPLEGABLE (Con N° Cliente, Cliente, Rentabilidad y Cupo Crédito condicionales)
+        # 6. DETALLE EN DESPLEGABLE
         # ==========================================
         with st.expander("Ver Detalle de cotizaciones abiertas", expanded=False):
-            # Columnas base visibles para TODOS los usuarios
+            # Columnas base visibles para TODOS los usuarios (incluido admin_punto)
             columnas_mostrar = [
                 'Documento', 'Numero_Cliente', 'Cliente', 'Almacen_Corto', 'Fecha_Texto', 
                 'Dias', 'Rango_Dias', 'Colaborador', 'Estado_IVA', 'Precio_Sin_IVA', 'Precio_Total'
             ]
             
-            # Agregamos columnas sensibles SOLO si el usuario es Admin o Gerente
+            # ✅ CORRECCIÓN: Rentabilidad y Cupo Crédito SOLO para admin, gerente y gerente_comercial
             if rol in ["admin", "gerente", "gerente_comercial"]:
                 columnas_mostrar.extend(['Rentabilidad', 'Cupo_Credito'])
             
