@@ -36,6 +36,7 @@ def ejecutar_etl():
     print("Guardando en PostgreSQL...")
     pg_engine = create_engine(secretos['postgres']['url'])
     with pg_engine.begin() as pg_conn:
+        # esto esun comentario
         pg_conn.execute(text("TRUNCATE TABLE sap_raw.remisiones RESTART IDENTITY CASCADE;"))
         pg_conn.execute(text("TRUNCATE TABLE sap_raw.colaboradores RESTART IDENTITY CASCADE;"))
     
