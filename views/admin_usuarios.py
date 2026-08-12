@@ -36,7 +36,7 @@ except Exception as e:
 # =====================================================================
 # 2. INTERFAZ EN PESTAÑAS
 # =====================================================================
-tab_crear, tab_editar, tab_reset = st.tabs(["🆕 Crear Usuario", "✏️ Consultar, Editar y Eliminar", "🔐 Resetear Claves"])
+tab_crear, tab_editar, tab_reset = st.tabs([" Crear Usuario", "✏️ Consultar, Editar y Eliminar", "🔐 Resetear Claves"])
 
 # ----------------- PESTAÑA 1: CREAR USUARIO -----------------
 with tab_crear:
@@ -59,14 +59,9 @@ with tab_crear:
             
             if rol_seleccionado == "admin_punto":
                 if almacen_sel != "Seleccione un almacén...":
-                    mapa_almacenes = {
-                        "EJECUTIVOS COMERCIALES": "EJECOM", "PUNTO 134": "ALM134", "7 DE AGOSTO": "7AGOS",
-                        "AVENIDA19": "AV19", "CENTRO 1": "Q1", "CENTRO 3": "Q3", "CENTRO 5": "Q5",
-                        "CENTRO 6": "Q6", "PUNTO170": "ALM170", "NORTE128": "ALM128", 
-                        "VILLAVICENCIO": "VILL", "ARMENIA": "ARME"
-                    }
-                    sap_branch = mapa_almacenes.get(almacen_sel, almacen_sel)
-                    st.info(f"💡 Se asignará el código de sede: **{sap_branch}**")
+                    # ✅ AHORA GUARDAMOS EL NOMBRE COMPLETO DEL ALMACÉN, NO EL CÓDIGO CORTO
+                    sap_branch = almacen_sel  # Guardamos "EJECUTIVOS COMERCIALES" tal cual
+                    st.info(f"💡 Se asignará el almacén: **{sap_branch}**")
                     
             elif rol_seleccionado == "comercial":
                 colab_sel = st.selectbox("👤 Vincular con Vendedor SAP:", lista_comerciales)
@@ -77,9 +72,9 @@ with tab_crear:
     
     if st.button("🚀 Crear Usuario", type="primary"):
         if not nuevo_usuario or not nombre_visible:
-            st.error("⚠️ El usuario y el nombre son obligatorios.")
+            st.error("️ El usuario y el nombre son obligatorios.")
         elif depto_seleccionado == "VENTAS" and rol_seleccionado == "comercial" and sap_owner is None:
-            st.error("⚠️ Para el rol comercial de ventas debes seleccionar su equivalente de la lista de SAP.")
+            st.error("️ Para el rol comercial de ventas debes seleccionar su equivalente de la lista de SAP.")
         elif depto_seleccionado == "VENTAS" and rol_seleccionado == "admin_punto" and sap_branch is None:
             st.error("⚠️ Para el rol admin_punto debes seleccionar un almacén.")
         else:
@@ -95,7 +90,7 @@ with tab_crear:
                         "rol": rol_seleccionado,
                         "dep": depto_seleccionado, 
                         "owner": sap_owner, 
-                        "branch": sap_branch
+                        "branch": sap_branch  # Ahora guarda el nombre completo
                     })
                     session.commit()
                 st.success(f"✅ ¡Usuario '{nuevo_usuario}' creado exitosamente!")
@@ -108,7 +103,6 @@ with tab_editar:
     st.subheader("Usuarios Registrados en el Sistema")
     df_usuarios = conn.query("SELECT id, usuario, nombre_completo, rol, departamento, sap_branch_code, sap_owner_code FROM app.usuarios_portal ORDER BY usuario ASC", ttl=0)
     
-    # ✅ Agregamos sap_branch_code a la vista para que el admin pueda verificarlo
     st.dataframe(df_usuarios[['usuario', 'nombre_completo', 'departamento', 'rol', 'sap_branch_code', 'sap_owner_code']], use_container_width=True, hide_index=True)
     
     st.markdown("---")
@@ -131,8 +125,9 @@ with tab_editar:
                 lista_deptos = ["VENTAS", "COMPRAS", "CONTABILIDAD", "GERENCIA", "SISTEMAS"]
                 e_depto = st.selectbox("Departamento", lista_deptos, index=lista_deptos.index(datos_usr['departamento']) if datos_usr['departamento'] in lista_deptos else 0)
                 
+                # ✅ Ahora mostramos el nombre completo del almacén
                 val_b = str(datos_usr['sap_branch_code']) if pd.notna(datos_usr['sap_branch_code']) else ""
-                e_branch = st.text_input("Código de Sede SAP (Branch Code, ej: Q1, ALM134)", value=val_b).strip().upper()
+                e_branch = st.text_input("Almacén / Sede (ej: EJECUTIVOS COMERCIALES, CENTRO 1)", value=val_b).strip()
                 
                 val_o = int(datos_usr['sap_owner_code']) if pd.notna(datos_usr['sap_owner_code']) else 0
                 e_owner = st.number_input("Código Comercial SAP (Owner Code)", value=val_o)
@@ -159,7 +154,7 @@ with tab_editar:
                 st.rerun()
 
         # ==========================================
-        # ✅ NUEVA SECCIÓN: ELIMINAR USUARIO (Con doble verificación)
+        # ✅ NUEVA SECCIÓN: ELIMINAR USUARIO
         # ==========================================
         st.markdown("---")
         st.subheader(f"🗑️ Eliminar Usuario: **{usuario_a_editar}**")
@@ -167,11 +162,9 @@ with tab_editar:
         
         col_del1, col_del2 = st.columns([3, 1])
         with col_del1:
-            # Casilla de confirmación obligatoria
             confirm_delete = st.checkbox("✅ Confirmo que deseo eliminar este usuario permanentemente.", key=f"chk_del_{usuario_a_editar}")
         
         with col_del2:
-            # Botón de eliminación
             if st.button("🚨 ELIMINAR", type="primary", key=f"btn_del_{usuario_a_editar}"):
                 if confirm_delete:
                     try:
