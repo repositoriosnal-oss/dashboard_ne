@@ -110,7 +110,7 @@ def ejecutar_sincronizacion_desde_sap():
                 T0."DocDate" as "Fecha_Contabilizacion", 
                 T0."DocStatus" as "Status_Documento", 
                 T0."OwnerCode" as "Propietario_Doc",
-                T2."WhsName" as "Sede_Codigo",
+                T2."WhsName" as "Sede_Codigo",   -- correccion de sede
                 T1."ItemCode" as "Numero_Articulo", T1."Dscription" as "Descripcion", 
                 T1."Quantity" as "Cantidad", T1."Price" as "Precio", 
                 T1."LineTotal" AS "Precio_Sin_IVA", T1."LineTotal" + T1."VatSum" AS "Precio_Total",

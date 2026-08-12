@@ -34,7 +34,7 @@ except Exception as e:
     dict_comerciales = {}
 
 # =====================================================================
-# 2. INTERFAZ EN PESTAÑAS
+# 2. INTERFAZ EN PESTAÑAS|
 # =====================================================================
 tab_crear, tab_editar, tab_reset = st.tabs([" Crear Usuario", "✏️ Consultar, Editar y Eliminar", "🔐 Resetear Claves"])
 
