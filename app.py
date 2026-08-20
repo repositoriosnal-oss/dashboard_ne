@@ -9,12 +9,14 @@ st.set_page_config(
     page_icon=":material/business:"
 )
 
-# --- RUTA DEL LOGO DE LA EMPRESA ---
+# ============================================================
+# RUTA DEL LOGO DE LA EMPRESA
+# ============================================================
 RUTA_LOGO = Path(__file__).parent / "logo_empresa.png"
 
-# ==========================================
+# ============================================================
 # 1. CONTROL DE AUTENTICACIÓN
-# ==========================================
+# ============================================================
 if "autenticado" not in st.session_state:
     st.session_state["autenticado"] = False
 
@@ -27,14 +29,11 @@ if not st.session_state["autenticado"]:
     st.title("Acceso Portal Corporativo")
 
     with st.form("login_form"):
-        # ✅ MEJORA: .strip().lower() evita errores por espacios accidentales o mayúsculas
         usuario_input = st.text_input("Usuario").strip().lower()
         clave_input = st.text_input("Contraseña", type="password")
 
         if st.form_submit_button("Iniciar sesión", icon=":material/login:"):
             conn_db = st.connection("postgresql", type="sql", url=st.secrets["postgres"]["url"])
-            
-            # ✅ MEJORA CRÍTICA: Se agrega "AND activo = TRUE" para impedir el acceso a usuarios bloqueados
             user_df = conn_db.query(
                 "SELECT * FROM app.usuarios_portal WHERE usuario = :usr AND activo = TRUE",
                 params={"usr": usuario_input}
@@ -50,15 +49,14 @@ if not st.session_state["autenticado"]:
                 st.session_state["departamento"] = user_df.iloc[0]["departamento"]
                 st.rerun()
             else:
-                # Mensaje genérico por seguridad, pero que informa del bloqueo
                 st.error("❌ Credenciales inválidas o usuario bloqueado. Intenta de nuevo.")
-
     st.stop()
 
-# ==========================================
-# 2. DECLARACIÓN DE PÁGINAS (Íconos únicos)
-# ==========================================
+# ============================================================
+# 2. DECLARACIÓN DE PÁGINAS (sin espacios en rutas)
+# ============================================================
 pag_inicio = st.Page("views/inicio.py", title="Inicio", icon=":material/home:", default=True)
+pag_ventas_meta = st.Page("views/ventas.py", title="Ventas vs Metas", icon=":material/trending_up:")
 pag_remisiones = st.Page("views/ventas_remisiones.py", title="Remisiones Abiertas", icon=":material/local_shipping:")
 pag_cotizaciones = st.Page("views/cotizaciones_abiertas.py", title="Cotizaciones Abiertas", icon=":material/request_quote:")
 pag_ordenes = st.Page("views/ordenes_venta_abiertas.py", title="Órdenes de Venta", icon=":material/shopping_cart:")
@@ -68,32 +66,39 @@ pag_facturas = st.Page("views/facturas_reserva.py", title="Facturas de Reserva",
 pag_notas = st.Page("views/notas_credito.py", title="Notas Crédito Abiertas", icon=":material/credit_score:")
 pag_usuarios = st.Page("views/admin_usuarios.py", title="Gestión de Usuarios", icon=":material/group:")
 
-# ==========================================
+# ============================================================
 # 3. MENÚ DINÁMICO POR DEPARTAMENTO Y ROL
-# ==========================================
+# ============================================================
 estructura_menu = [pag_inicio]
 depto_usuario = st.session_state["departamento"]
 
 if depto_usuario in ["VENTAS", "SISTEMAS", "GERENCIA"]:
-    estructura_menu += [pag_remisiones, pag_cotizaciones, pag_ordenes, pag_traslados, pag_facturas, pag_notas, pag_compras]
+    estructura_menu += [
+        pag_ventas_meta,
+        pag_remisiones,
+        pag_cotizaciones,
+        pag_ordenes,
+        pag_traslados,
+        pag_facturas,
+        pag_notas,
+        pag_compras,
+    ]
 
 if st.session_state["rol_actual"] == "admin":
     estructura_menu.append(pag_usuarios)
 
 navegacion = st.navigation(estructura_menu)
 
-# ==========================================
+# ============================================================
 # 4. EJECUCIÓN DE LA PÁGINA ACTUAL
-# ==========================================
+# ============================================================
 navegacion.run()
 
-# ==========================================
-# 5. SIDEBAR: Info Usuario, Admin y Cierre de Sesión
-# ==========================================
+# ============================================================
+# 5. SIDEBAR: Info Usuario, Sincronización y Cierre de Sesión
+# ============================================================
 with st.sidebar:
     st.markdown("---")
-    
-    # Info del usuario logueado
     st.write(f"👤 **{st.session_state['nombre_completo']}**")
     st.caption(f"Depto: {st.session_state['departamento']} | Rol: {st.session_state['rol_actual'].upper()}")
     st.markdown("---")

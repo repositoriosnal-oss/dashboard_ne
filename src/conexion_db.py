@@ -4,19 +4,30 @@ import numpy as np
 import pyodbc
 from sqlalchemy import create_engine, text
 
-# Conexión centralizada usando los secretos seguros
+# ============================================================
+# CONEXIÓN CENTRALIZADA POSTGRESQL (usando secretos seguros)
+# ============================================================
 CADENA_CONEXION_PG = st.secrets["postgres"]["url"]
-
 conn = st.connection("postgresql", type="sql", url=CADENA_CONEXION_PG)
 
+# ============================================================
+# FUNCIÓN PRINCIPAL DE SINCRONIZACIÓN ELT DESDE SAP
+# ============================================================
 def ejecutar_sincronizacion_desde_sap():
     """Extrae datos de SAP HANA y los almacena en PostgreSQL"""
     try:
         sap_conf = st.secrets["sap"]
-        conn_str_sap = f"DRIVER={sap_conf['driver']};SERVERNODE={sap_conf['server']};UID={sap_conf['user']};PWD={sap_conf['password']}"
+        conn_str_sap = (
+            f"DRIVER={sap_conf['driver']};"
+            f"SERVERNODE={sap_conf['server']};"
+            f"UID={sap_conf['user']};"
+            f"PWD={sap_conf['password']}"
+        )
         conexion_sap = pyodbc.connect(conn_str_sap)
-        
-        # --- 1. QUERIES DE EXTRACCIÓN SAP ---
+
+        # ============================================================
+        # 1. QUERIES DE EXTRACCIÓN SAP (módulos existentes)
+        # ============================================================
         query_remisiones = """
             SELECT T0."DocNum" as "Documento", T0."CardName" as "Cliente", T0."DocDate" as "Fecha_Contabilizacion", 
             T0."DocStatus" as "Status_Documento", T0."SlpCode" as "Empleado_Ventas", T0."OwnerCode" as "Propietario_Doc",
@@ -70,7 +81,6 @@ def ejecutar_sincronizacion_desde_sap():
             INNER JOIN "NE042025"."OCRD" T6 ON T0."CardCode" = T6."CardCode"
             WHERE T0."DocStatus" = 'O' AND T2."WhsName" <> 'BODEGA INGENIERIA'
         """
-        # ✅ CORREGIDO: Agregado T0."CardCode" as "Numero_Cliente"
         query_ordenes = """
             SELECT T0."DocNum" as "Documento", T0."CardCode" as "Numero_Cliente", T0."CardName" as "Cliente", T0."DocDate" as "Fecha_Contabilizacion", 
             T0."DocStatus" as "Status_Documento", T0."SlpCode" as "Empleado_Ventas", T0."OwnerCode" as "Propietario_Doc",
@@ -110,7 +120,7 @@ def ejecutar_sincronizacion_desde_sap():
                 T0."DocDate" as "Fecha_Contabilizacion", 
                 T0."DocStatus" as "Status_Documento", 
                 T0."OwnerCode" as "Propietario_Doc",
-                T2."WhsName" as "Sede_Codigo",   -- correccion de sede
+                T2."WhsName" as "Sede_Codigo",
                 T1."ItemCode" as "Numero_Articulo", T1."Dscription" as "Descripcion", 
                 T1."Quantity" as "Cantidad", T1."Price" as "Precio", 
                 T1."LineTotal" AS "Precio_Sin_IVA", T1."LineTotal" + T1."VatSum" AS "Precio_Total",
@@ -125,7 +135,6 @@ def ejecutar_sincronizacion_desde_sap():
             LEFT JOIN "NE042025"."OWHS" T6 ON T0."Filler" = T6."WhsCode"
             WHERE T0."DocStatus" = 'O' AND T2."WhsName" <> 'BODEGA INGENIERIA'
         """
-        # ✅ CORREGIDO: Agregado T0."CardCode" as "Numero_Cliente"
         query_facturas = """
             SELECT T0."DocNum" as "Documento", T0."CardCode" as "Numero_Cliente", T0."CardName" as "Cliente", T0."DocDate" as "Fecha_Contabilizacion", 
             T0."DocStatus" as "Status_Documento", T0."SlpCode" as "Empleado_Ventas", T0."OwnerCode" as "Propietario_Doc",
@@ -141,7 +150,6 @@ def ejecutar_sincronizacion_desde_sap():
             LEFT JOIN "NE042025"."OHEM" T4 ON T5."INTERNAL_K" = T4."empID"
             WHERE T0."DocStatus" = 'O' AND T0."isIns" = 'Y' AND T2."WhsName" <> 'BODEGA INGENIERIA'
         """
-        # ✅ CORREGIDO: Agregado T0."CardCode" as "Numero_Cliente"
         query_notas = """
             SELECT T0."DocNum" as "Documento", T0."CardCode" as "Numero_Cliente", T0."CardName" as "Cliente", T0."DocDate" as "Fecha_Contabilizacion", 
             T0."DocStatus" as "Status_Documento", T0."SlpCode" as "Empleado_Ventas", T0."OwnerCode" as "Propietario_Doc",
@@ -157,7 +165,121 @@ def ejecutar_sincronizacion_desde_sap():
             LEFT JOIN "NE042025"."OHEM" T4 ON T5."INTERNAL_K" = T4."empID"
             WHERE T0."DocStatus" = 'O' AND T2."WhsName" <> 'BODEGA INGENIERIA'
         """
-        
+
+        # ============================================================
+        # 🆕 NUEVO QUERY: VENTAS NETAS (Facturas - Notas Crédito)
+        # Período de prueba: últimos 3 meses
+        # Para producción: cambiar ADD_MONTHS(CURRENT_DATE, -3) por TO_DATE('2025-04-01','YYYY-MM-DD')
+        # ============================================================
+        query_ventas_netas = """
+            SELECT
+                T0."DocDate" AS "fecha_contabilizacion",
+                T0."DocNum" AS "documento",
+                T0."CardCode" AS "codigo_cliente",
+                T0."CardName" AS "nombre_cliente",
+                T1."LineTotal" AS "precio_sin_iva",
+                (T1."LineTotal" + T1."VatSum") AS "precio_con_iva",
+                (T1."LineTotal" - T1."GrssProfit") AS "costo_total",
+                T1."GrssProfit" AS "rentabilidad",
+                COALESCE(T2."U_NAME", 'Sin Usuario') AS "nombre_usuario",
+                T0."SlpCode" AS "codigo_vendedor",
+                COALESCE(T4."SlpName", 'Sin Vendedor') AS "nombre_vendedor",
+                COALESCE(T3."SeriesName", '') AS "nombre_serie",
+                COALESCE(T3."BeginStr", '') AS "prefijo_serie",
+                T1."WhsCode" AS "codigo_almacen",
+                CASE 
+                    WHEN T3."SeriesName" IN ('128E', 'NCNT128.', 'ND-NT128', 'RC-NT128', 'NPNT128', '128J', '128F') THEN 'ALM128'
+                    WHEN T3."SeriesName" IN ('134E', '134F', 'NCAU134', 'NDFAU134', 'NPAU134', 'RC-AU134', '134J') THEN 'ALM134'
+                    WHEN T3."SeriesName" IN ('170E', 'NDFP170', 'NCPU170.', 'NPPU170', 'RC-PU170') THEN 'ALM170'
+                    WHEN T3."SeriesName" IN ('7AGE', 'NC7AGOS.', 'NP7AGOS', 'RC-7AGOS', 'NDF7AGOS', '7AGJ', '7AGF') THEN '7AGOS'
+                    WHEN T3."SeriesName" IN ('A19E', 'NCAVE19.', 'RC-AVE19', 'A19J', 'NDFAV19', 'NPAVE19') THEN 'AV19'
+                    WHEN T3."SeriesName" IN ('ARME', 'ARMJ', 'NCARMEN.', 'NDFARMEN', 'NPARMEN', 'RC-ARMEN', 'ND-ARMEN', 'ARMF') THEN 'ARME'
+                    WHEN T3."SeriesName" IN ('CHIE', 'CHIF', 'CHIJ', 'NCCHIA.', 'ND-CHIA', 'NPCHIA', 'RC-CHIA', 'NDFCHIA') THEN 'CHIA' 
+                    WHEN T3."SeriesName" IN ('COME', 'NCCOMER.', 'ND-COMER', 'NDFCOMER', 'NPCOMER', 'RC-COMER', 'COMF') THEN 'EJECOM' 
+                    WHEN T3."SeriesName" IN ('CT1E', 'NCCENT1.', 'ND-CENT1', 'NDFCENT1', 'RC-CENT1', 'CT1J', 'NPCENT1', 'CT1F') THEN 'Q1' 
+                    WHEN T3."SeriesName" IN ('CT3E', 'NCCENT3.', 'NPCENT3', 'RC-CENT3', 'CT3J') THEN 'Q3' 
+                    WHEN T3."SeriesName" IN ('CT5E', 'NCCENT5.', 'NPCENT5', 'RC-CENT5', 'NDFCENT5', 'CT5J') THEN 'Q5' 
+                    WHEN T3."SeriesName" IN ('CT6E', 'CT6J', 'NCCENT6.', 'NPCENT6', 'RC-CENT6', 'NDFCENT6') THEN 'Q6' 
+                    WHEN T3."SeriesName" IN ('VILE', 'VILF', 'VILJ', 'NCVILLA.', 'NPVILLA', 'RC-VILLA', 'ND-VILLA') THEN 'VILL' 
+                    ELSE COALESCE(T5."WhsName", 'Sin Almacen') 
+                END AS "nombre_almacen",
+                T0."OwnerCode" AS "propietario_doc",
+                COALESCE(T6."Code", '') AS "codigo_colaborador_slp",
+                COALESCE(T8."Code", '') AS "codigo_colaborador_owner"
+            FROM "NE042025".OINV T0
+            INNER JOIN "NE042025".INV1 T1 ON T0."DocEntry" = T1."DocEntry"
+            LEFT JOIN "NE042025".OUSR T2 ON T0."UserSign" = T2."USERID"
+            LEFT JOIN "NE042025".NNM1 T3 ON T0."Series" = T3."Series"
+            LEFT JOIN "NE042025".OSLP T4 ON T0."SlpCode" = T4."SlpCode"
+            LEFT JOIN "NE042025".OWHS T5 ON T1."WhsCode" = T5."WhsCode"
+            LEFT JOIN "NE042025".OHEM T6 ON T4."SlpCode" = T6."salesPrson"
+            LEFT JOIN "NE042025".OUSR T7 ON T0."OwnerCode" = T7."USERID"
+            LEFT JOIN "NE042025".OHEM T8 ON T7."INTERNAL_K" = T8."empID"
+            WHERE
+                T0."CANCELED" = 'N'
+                AND T0."DocDate" >= ADD_MONTHS(CURRENT_DATE, -5)
+                AND T0."DocDate" <= CURRENT_DATE
+                AND (T3."SeriesName" IS NULL 
+                     OR T3."SeriesName" NOT IN ('INGE','NDFINGEN','INGF','NCINGEN.','ND-INGEN','NPINGEN','FactClie','RC-INGEN'))
+                AND COALESCE(T5."WhsName", '') <> 'BODEGA INGENIERIA'
+
+            UNION ALL
+
+            SELECT
+                T0."DocDate" AS "fecha_contabilizacion",
+                T0."DocNum" AS "documento",
+                T0."CardCode" AS "codigo_cliente",
+                T0."CardName" AS "nombre_cliente",
+                -T1."LineTotal" AS "precio_sin_iva",
+                (T1."LineTotal" + T1."VatSum") AS "precio_con_iva",
+                -(T1."LineTotal" - T1."GrssProfit") AS "costo_total",
+                -T1."GrssProfit" AS "rentabilidad",
+                COALESCE(T2."U_NAME", 'Sin Usuario') AS "nombre_usuario",
+                T0."SlpCode" AS "codigo_vendedor",
+                COALESCE(T4."SlpName", 'Sin Vendedor') AS "nombre_vendedor",
+                COALESCE(T3."SeriesName", '') AS "nombre_serie",
+                COALESCE(T3."BeginStr", '') AS "prefijo_serie",
+                T1."WhsCode" AS "codigo_almacen",
+                CASE 
+                    WHEN T3."SeriesName" IN ('128E', 'NCNT128.', 'ND-NT128', 'RC-NT128', 'NPNT128', '128J', '128F') THEN 'ALM128'
+                    WHEN T3."SeriesName" IN ('134E', '134F', 'NCAU134', 'NDFAU134', 'NPAU134', 'RC-AU134', '134J') THEN 'ALM134'
+                    WHEN T3."SeriesName" IN ('170E', 'NDFP170', 'NCPU170.', 'NPPU170', 'RC-PU170') THEN 'ALM170'
+                    WHEN T3."SeriesName" IN ('7AGE', 'NC7AGOS.', 'NP7AGOS', 'RC-7AGOS', 'NDF7AGOS', '7AGJ', '7AGF') THEN '7AGOS'
+                    WHEN T3."SeriesName" IN ('A19E', 'NCAVE19.', 'RC-AVE19', 'A19J', 'NDFAV19', 'NPAVE19') THEN 'AV19'
+                    WHEN T3."SeriesName" IN ('ARME', 'ARMJ', 'NCARMEN.', 'NDFARMEN', 'NPARMEN', 'RC-ARMEN', 'ND-ARMEN', 'ARMF') THEN 'ARME'
+                    WHEN T3."SeriesName" IN ('CHIE', 'CHIF', 'CHIJ', 'NCCHIA.', 'ND-CHIA', 'NPCHIA', 'RC-CHIA', 'NDFCHIA') THEN 'CHIA' 
+                    WHEN T3."SeriesName" IN ('COME', 'NCCOMER.', 'ND-COMER', 'NDFCOMER', 'NPCOMER', 'RC-COMER', 'COMF') THEN 'EJECOM' 
+                    WHEN T3."SeriesName" IN ('CT1E', 'NCCENT1.', 'ND-CENT1', 'NDFCENT1', 'RC-CENT1', 'CT1J', 'NPCENT1', 'CT1F') THEN 'Q1' 
+                    WHEN T3."SeriesName" IN ('CT3E', 'NCCENT3.', 'NPCENT3', 'RC-CENT3', 'CT3J') THEN 'Q3' 
+                    WHEN T3."SeriesName" IN ('CT5E', 'NCCENT5.', 'NPCENT5', 'RC-CENT5', 'NDFCENT5', 'CT5J') THEN 'Q5' 
+                    WHEN T3."SeriesName" IN ('CT6E', 'CT6J', 'NCCENT6.', 'NPCENT6', 'RC-CENT6', 'NDFCENT6') THEN 'Q6' 
+                    WHEN T3."SeriesName" IN ('VILE', 'VILF', 'VILJ', 'NCVILLA.', 'NPVILLA', 'RC-VILLA', 'ND-VILLA') THEN 'VILL' 
+                    ELSE COALESCE(T5."WhsName", 'Sin Almacen') 
+                END AS "nombre_almacen",
+                T0."OwnerCode" AS "propietario_doc",
+                COALESCE(T6."Code", '') AS "codigo_colaborador_slp",
+                COALESCE(T8."Code", '') AS "codigo_colaborador_owner"
+            FROM "NE042025".ORIN T0
+            INNER JOIN "NE042025".RIN1 T1 ON T0."DocEntry" = T1."DocEntry"
+            LEFT JOIN "NE042025".OUSR T2 ON T0."UserSign" = T2."USERID"
+            LEFT JOIN "NE042025".NNM1 T3 ON T0."Series" = T3."Series"
+            LEFT JOIN "NE042025".OSLP T4 ON T0."SlpCode" = T4."SlpCode"
+            LEFT JOIN "NE042025".OWHS T5 ON T1."WhsCode" = T5."WhsCode"
+            LEFT JOIN "NE042025".OHEM T6 ON T4."SlpCode" = T6."salesPrson"
+            LEFT JOIN "NE042025".OUSR T7 ON T0."OwnerCode" = T7."USERID"
+            LEFT JOIN "NE042025".OHEM T8 ON T7."INTERNAL_K" = T8."empID"
+            WHERE
+                T0."CANCELED" = 'N'
+                AND T0."DocDate" >= ADD_MONTHS(CURRENT_DATE, -5)
+                AND T0."DocDate" <= CURRENT_DATE
+                AND (T3."SeriesName" IS NULL 
+                     OR T3."SeriesName" NOT IN ('INGE','NDFINGEN','INGF','NCINGEN.','ND-INGEN','NPINGEN','FactClie','RC-INGEN'))
+                AND COALESCE(T5."WhsName", '') <> 'BODEGA INGENIERIA'
+        """
+
+        # ============================================================
+        # 2. EJECUTAR QUERIES EN SAP
+        # ============================================================
         df_remisiones = pd.read_sql(query_remisiones, conexion_sap)
         df_colaboradores = pd.read_sql(query_colaboradores, conexion_sap)
         df_cotizaciones = pd.read_sql(query_cotizaciones, conexion_sap)
@@ -166,12 +288,16 @@ def ejecutar_sincronizacion_desde_sap():
         df_traslados = pd.read_sql(query_traslados, conexion_sap)
         df_facturas = pd.read_sql(query_facturas, conexion_sap)
         df_notas = pd.read_sql(query_notas, conexion_sap)
+        df_ventas_netas = pd.read_sql(query_ventas_netas, conexion_sap)  # 🆕
 
-        conexion_sap.close() 
-        
-        # --- 2. CONEXIÓN A POSTGRES ---
+        conexion_sap.close()
+
+        # ============================================================
+        # 3. CONEXIÓN A POSTGRES Y CARGA DE DATOS
+        # ============================================================
         pg_engine = create_engine(CADENA_CONEXION_PG)
-        
+
+        # SQL para crear vistas con rangos de días
         sql_vista_rem = """CREATE OR REPLACE VIEW sap_raw.vw_remisiones_con_rangos AS SELECT r.*, sap_raw.calcular_rango_dias(r."Fecha_Contabilizacion"::date) AS "Rango_Dias" FROM sap_raw.remisiones r;"""
         sql_vista_cot = """CREATE OR REPLACE VIEW sap_raw.vw_cotizaciones_con_rangos AS SELECT c.*, sap_raw.calcular_rango_dias(c."Fecha_Contabilizacion"::date) AS "Rango_Dias" FROM sap_raw.cotizaciones c;"""
         sql_vista_ord = """CREATE OR REPLACE VIEW sap_raw.vw_ordenes_venta_con_rangos AS SELECT o.*, sap_raw.calcular_rango_dias(o."Fecha_Contabilizacion"::date) AS "Rango_Dias" FROM sap_raw.ordenes_venta o;"""
@@ -179,7 +305,10 @@ def ejecutar_sincronizacion_desde_sap():
         sql_vista_tra = """CREATE OR REPLACE VIEW sap_raw.vw_solicitudes_traslados_con_rangos AS SELECT s.*, sap_raw.calcular_rango_dias(s."Fecha_Contabilizacion"::date) AS "Rango_Dias" FROM sap_raw.solicitudes_traslados s;"""
         sql_vista_fac = """CREATE OR REPLACE VIEW sap_raw.vw_facturas_reserva_con_rangos AS SELECT f.*, sap_raw.calcular_rango_dias(f."Fecha_Contabilizacion"::date) AS "Rango_Dias" FROM sap_raw.facturas_reserva f;"""
         sql_vista_nc = """CREATE OR REPLACE VIEW sap_raw.vw_notas_credito_con_rangos AS SELECT n.*, sap_raw.calcular_rango_dias(n."Fecha_Contabilizacion"::date) AS "Rango_Dias" FROM sap_raw.notas_credito n;"""
+        # 🆕 Vista para ventas netas (usa la misma función calcular_rango_dias)
+        sql_vista_ventas = """CREATE OR REPLACE VIEW sap_raw.vw_ventas_netas_con_rangos AS SELECT v.*, sap_raw.calcular_rango_dias(v."fecha_contabilizacion"::date) AS "Rango_Dias" FROM sap_raw.ventas_netas v;"""
 
+        # Eliminar vistas existentes antes de recrearlas
         with pg_engine.begin() as pg_conn:
             pg_conn.execute(text("DROP VIEW IF EXISTS sap_raw.vw_remisiones_con_rangos CASCADE;"))
             pg_conn.execute(text("DROP VIEW IF EXISTS sap_raw.vw_cotizaciones_con_rangos CASCADE;"))
@@ -188,16 +317,20 @@ def ejecutar_sincronizacion_desde_sap():
             pg_conn.execute(text("DROP VIEW IF EXISTS sap_raw.vw_solicitudes_traslados_con_rangos CASCADE;"))
             pg_conn.execute(text("DROP VIEW IF EXISTS sap_raw.vw_facturas_reserva_con_rangos CASCADE;"))
             pg_conn.execute(text("DROP VIEW IF EXISTS sap_raw.vw_notas_credito_con_rangos CASCADE;"))
-        
+            pg_conn.execute(text("DROP VIEW IF EXISTS sap_raw.vw_ventas_netas_con_rangos CASCADE;"))  # 🆕
+
+        # Cargar datos crudos en PostgreSQL
         df_remisiones.to_sql('remisiones', pg_engine, schema='sap_raw', if_exists='replace', index=False)
         df_colaboradores.to_sql('colaboradores', pg_engine, schema='sap_raw', if_exists='replace', index=False)
         df_cotizaciones.to_sql('cotizaciones', pg_engine, schema='sap_raw', if_exists='replace', index=False)
         df_ordenes.to_sql('ordenes_venta', pg_engine, schema='sap_raw', if_exists='replace', index=False)
-        df_solicitudes.to_sql('solicitudes_compras', pg_engine, schema='sap_raw', if_exists='replace', index=False) 
+        df_solicitudes.to_sql('solicitudes_compras', pg_engine, schema='sap_raw', if_exists='replace', index=False)
         df_traslados.to_sql('solicitudes_traslados', pg_engine, schema='sap_raw', if_exists='replace', index=False)
         df_facturas.to_sql('facturas_reserva', pg_engine, schema='sap_raw', if_exists='replace', index=False)
         df_notas.to_sql('notas_credito', pg_engine, schema='sap_raw', if_exists='replace', index=False)
-        
+        df_ventas_netas.to_sql('ventas_netas', pg_engine, schema='sap_raw', if_exists='replace', index=False)  # 🆕
+
+        # Recrear vistas con Rango_Dias
         with pg_engine.begin() as pg_conn:
             pg_conn.execute(text(sql_vista_rem))
             pg_conn.execute(text(sql_vista_cot))
@@ -206,12 +339,22 @@ def ejecutar_sincronizacion_desde_sap():
             pg_conn.execute(text(sql_vista_tra))
             pg_conn.execute(text(sql_vista_fac))
             pg_conn.execute(text(sql_vista_nc))
-            
+            pg_conn.execute(text(sql_vista_ventas))  # 🆕
+
+            # 🆕 Crear índices para optimizar el dashboard de ventas
+            pg_conn.execute(text("CREATE INDEX IF NOT EXISTS idx_ventas_fecha ON sap_raw.ventas_netas (fecha_contabilizacion)"))
+            pg_conn.execute(text("CREATE INDEX IF NOT EXISTS idx_ventas_almacen ON sap_raw.ventas_netas (codigo_almacen)"))
+            pg_conn.execute(text("CREATE INDEX IF NOT EXISTS idx_ventas_vendedor ON sap_raw.ventas_netas (codigo_vendedor)"))
+
         return True
     except Exception as e:
         st.error(f"❌ Error en sincronización: {e}")
         return False
 
+
+# ============================================================
+# FUNCIONES DE CARGA Y TRANSFORMACIÓN (módulos existentes)
+# ============================================================
 @st.cache_data(ttl=600)
 def cargar_y_transformar_remisiones():
     try:
@@ -229,32 +372,6 @@ def cargar_y_transformar_remisiones():
         st.error(f"Error analizando datos en Postgres: {e}")
         return pd.DataFrame()
 
-def aplicar_seguridad_rls(df):
-    import streamlit as st
-    if df is None or df.empty: return df
-    rol = st.session_state.get('rol_actual', 'comercial')
-    df_filtrado = df.copy()
-    if 'Propietario_Doc' in df_filtrado.columns: df_filtrado['Propietario_Doc'] = df_filtrado['Propietario_Doc'].astype(str).str.strip()
-    if 'Empleado_Ventas' in df_filtrado.columns: df_filtrado['Empleado_Ventas'] = df_filtrado['Empleado_Ventas'].astype(str).str.strip()
-    if 'Sede_Codigo' in df_filtrado.columns: df_filtrado['Sede_Codigo'] = df_filtrado['Sede_Codigo'].astype(str).str.strip()
-    if rol in ["admin", "gerente", "gerente_comercial"]: return df_filtrado
-    elif rol == "admin_punto":
-        sap_branch = st.session_state.get('sap_branch_code')
-        # Validamos que no sea None, ni vacío, ni la cadena de texto "None"
-        if sap_branch and str(sap_branch).strip().lower() not in ['none', '']:
-            sap_branch = str(sap_branch).strip().upper()
-            if 'Sede_Codigo' in df_filtrado.columns:
-                # Comparamos en mayúsculas para evitar errores de tipeo
-                return df_filtrado[df_filtrado['Sede_Codigo'].str.upper() == sap_branch]
-        # Si no tiene un branch code válido, no mostramos nada (seguridad por defecto)
-        return df_filtrado.iloc[0:0]
-    elif rol == "comercial":
-        sap_owner = str(st.session_state.get('sap_owner_code', '')).strip()
-        sap_slp = str(st.session_state.get('sap_slp_code', '')).strip()
-        condicion_owner = df_filtrado['Propietario_Doc'] == sap_owner if sap_owner else False
-        condicion_slp = df_filtrado['Empleado_Ventas'] == sap_slp if sap_slp else False
-        return df_filtrado[condicion_owner | condicion_slp]
-    return df_filtrado
 
 @st.cache_data(ttl=600)
 def cargar_y_transformar_cotizaciones():
@@ -271,7 +388,7 @@ def cargar_y_transformar_cotizaciones():
         st.error(f"Error analizando cotizaciones en Postgres: {e}")
         return pd.DataFrame()
 
-# ✅ CORREGIDO: Agregado 'Numero_Cliente' a columnas_esperadas
+
 @st.cache_data(ttl=600)
 def cargar_y_transformar_ordenes():
     try:
@@ -286,7 +403,8 @@ def cargar_y_transformar_ordenes():
     except Exception as e:
         st.error(f"Error analizando órdenes de venta en Postgres: {e}")
         return pd.DataFrame()
-    
+
+
 @st.cache_data(ttl=600)
 def cargar_y_transformar_solicitudes():
     try:
@@ -302,13 +420,14 @@ def cargar_y_transformar_solicitudes():
         st.error(f"Error analizando solicitudes en Postgres: {e}")
         return pd.DataFrame()
 
+
 @st.cache_data(ttl=600)
 def cargar_y_transformar_traslados():
     try:
         df = conn.query("SELECT * FROM sap_raw.vw_solicitudes_traslados_con_rangos")
         columnas_esperadas = [
-            'Documento', 'Observaciones', 'Almacen_Origen', 'Fecha_Contabilizacion', 'Status_Documento', 
-            'Propietario_Doc', 'Numero_Articulo', 'Descripcion', 'Cantidad', 'Precio', 
+            'Documento', 'Observaciones', 'Almacen_Origen', 'Fecha_Contabilizacion', 'Status_Documento',
+            'Propietario_Doc', 'Numero_Articulo', 'Descripcion', 'Cantidad', 'Precio',
             'Precio_Sin_IVA', 'Precio_Total', 'Almacen', 'Nombre_Usuario', 'Colaborador', 'Rango_Dias'
         ]
         mapeo = {c.lower().strip(): c for c in columnas_esperadas}
@@ -321,15 +440,15 @@ def cargar_y_transformar_traslados():
         st.error(f"Error analizando traslados en Postgres: {e}")
         return pd.DataFrame()
 
-# ✅ CORREGIDO: Agregado 'Numero_Cliente' a columnas_esperadas
+
 @st.cache_data(ttl=600)
 def cargar_y_transformar_facturas():
     try:
         df = conn.query("SELECT * FROM sap_raw.vw_facturas_reserva_con_rangos")
         columnas_esperadas = [
-            'Documento', 'Numero_Cliente', 'Cliente', 'Fecha_Contabilizacion', 'Status_Documento', 
-            'Empleado_Ventas', 'Propietario_Doc', 'Sede_Codigo', 'Numero_Articulo', 
-            'Descripcion', 'Cantidad', 'Precio', 'Precio_Sin_IVA', 'Precio_Total', 
+            'Documento', 'Numero_Cliente', 'Cliente', 'Fecha_Contabilizacion', 'Status_Documento',
+            'Empleado_Ventas', 'Propietario_Doc', 'Sede_Codigo', 'Numero_Articulo',
+            'Descripcion', 'Cantidad', 'Precio', 'Precio_Sin_IVA', 'Precio_Total',
             'Almacen', 'Nombre_Usuario', 'Colaborador', 'Rango_Dias'
         ]
         mapeo = {c.lower().strip(): c for c in columnas_esperadas}
@@ -342,15 +461,15 @@ def cargar_y_transformar_facturas():
         st.error(f"Error analizando facturas reserva en Postgres: {e}")
         return pd.DataFrame()
 
-# ✅ CORREGIDO: Agregado 'Numero_Cliente' a columnas_esperadas
+
 @st.cache_data(ttl=600)
 def cargar_y_transformar_notas():
     try:
         df = conn.query("SELECT * FROM sap_raw.vw_notas_credito_con_rangos")
         columnas_esperadas = [
-            'Documento', 'Numero_Cliente', 'Cliente', 'Fecha_Contabilizacion', 'Status_Documento', 
-            'Empleado_Ventas', 'Propietario_Doc', 'Sede_Codigo', 'Numero_Articulo', 
-            'Descripcion', 'Cantidad', 'Precio', 'Precio_Sin_IVA', 'Precio_Total', 
+            'Documento', 'Numero_Cliente', 'Cliente', 'Fecha_Contabilizacion', 'Status_Documento',
+            'Empleado_Ventas', 'Propietario_Doc', 'Sede_Codigo', 'Numero_Articulo',
+            'Descripcion', 'Cantidad', 'Precio', 'Precio_Sin_IVA', 'Precio_Total',
             'Almacen', 'Nombre_Usuario', 'Colaborador', 'Rango_Dias'
         ]
         mapeo = {c.lower().strip(): c for c in columnas_esperadas}
@@ -362,3 +481,97 @@ def cargar_y_transformar_notas():
     except Exception as e:
         st.error(f"Error analizando notas crédito en Postgres: {e}")
         return pd.DataFrame()
+
+
+# ============================================================
+# 🆕 NUEVA FUNCIÓN: CARGA Y TRANSFORMACIÓN DE VENTAS NETAS
+# ============================================================
+@st.cache_data(ttl=600)
+def cargar_y_transformar_ventas():
+    """Lee ventas netas desde PostgreSQL"""
+    try:
+        df = conn.query("SELECT * FROM sap_raw.ventas_netas")
+        if df.empty:
+            return pd.DataFrame()
+
+        # Estandarizar tipos
+        df["fecha_contabilizacion"] = pd.to_datetime(df["fecha_contabilizacion"], errors="coerce")
+        for col in ["precio_sin_iva", "costo_total", "rentabilidad"]:
+            if col in df.columns:
+                df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0)
+        if "codigo_vendedor" in df.columns:
+            df["codigo_vendedor"] = pd.to_numeric(df["codigo_vendedor"], errors="coerce").fillna(0).astype(int)
+
+        # ✅ Asignación directa (el SQL ya trae códigos cortos)
+        df["Almacen_Corto"] = df["nombre_almacen"]
+        df["Mes_Texto"] = df["fecha_contabilizacion"].dt.strftime("%b %Y")
+        df["Dias"] = (pd.Timestamp.now().normalize() - df["fecha_contabilizacion"]).dt.days
+        return df
+    except Exception as e:
+        st.error(f"Error analizando ventas netas en Postgres: {e}")
+        return pd.DataFrame()
+
+
+# ============================================================
+# SEGURIDAD RLS (módulos existentes - remisiones, cotizaciones, etc.)
+# ============================================================
+def aplicar_seguridad_rls(df):
+    import streamlit as st
+    if df is None or df.empty: return df
+    rol = st.session_state.get('rol_actual', 'comercial')
+    df_filtrado = df.copy()
+    if 'Propietario_Doc' in df_filtrado.columns: df_filtrado['Propietario_Doc'] = df_filtrado['Propietario_Doc'].astype(str).str.strip()
+    if 'Empleado_Ventas' in df_filtrado.columns: df_filtrado['Empleado_Ventas'] = df_filtrado['Empleado_Ventas'].astype(str).str.strip()
+    if 'Sede_Codigo' in df_filtrado.columns: df_filtrado['Sede_Codigo'] = df_filtrado['Sede_Codigo'].astype(str).str.strip()
+    if rol in ["admin", "gerente", "gerente_comercial"]: return df_filtrado
+    elif rol == "admin_punto":
+        sap_branch = st.session_state.get('sap_branch_code')
+        if sap_branch and str(sap_branch).strip().lower() not in ['none', '']:
+            sap_branch = str(sap_branch).strip().upper()
+            if 'Sede_Codigo' in df_filtrado.columns:
+                return df_filtrado[df_filtrado['Sede_Codigo'].str.upper() == sap_branch]
+        return df_filtrado.iloc[0:0]
+    elif rol == "comercial":
+        sap_owner = str(st.session_state.get('sap_owner_code', '')).strip()
+        sap_slp = str(st.session_state.get('sap_slp_code', '')).strip()
+        condicion_owner = df_filtrado['Propietario_Doc'] == sap_owner if sap_owner else False
+        condicion_slp = df_filtrado['Empleado_Ventas'] == sap_slp if sap_slp else False
+        return df_filtrado[condicion_owner | condicion_slp]
+    return df_filtrado
+
+
+# ============================================================
+# 🆕 NUEVA FUNCIÓN: RLS ESPECÍFICO PARA VENTAS (Metas)
+# ============================================================
+def aplicar_seguridad_rls_ventas(df: pd.DataFrame) -> pd.DataFrame:
+    """RLS específico para el módulo de ventas con metas.
+    - admin/gerente: ve todo
+    - admin_punto: ve solo su almacén (por nombre_almacen)
+    - comercial: ve solo sus ventas (por codigo_vendedor)
+    """
+    if df is None or df.empty:
+        return df
+    rol = st.session_state.get("rol_actual", "comercial")
+    df_filtrado = df.copy()
+
+    if rol in ["admin", "gerente", "gerente_comercial"]:
+        return df_filtrado
+
+    if rol == "admin_punto":
+        branch = str(st.session_state.get("sap_branch_code", "")).strip()
+        if not branch or branch.lower() in ['none', '']:
+            return df_filtrado.iloc[0:0]
+        # Filtrar por nombre_almacen (campo del nuevo query)
+        if "nombre_almacen" in df_filtrado.columns:
+            return df_filtrado[df_filtrado["nombre_almacen"].str.upper().str.strip() == branch.upper()].copy()
+        return df_filtrado.iloc[0:0]
+
+    if rol == "comercial":
+        owner = st.session_state.get("sap_owner_code")
+        if owner is None or str(owner).strip() == "" or str(owner).strip().lower() == "none":
+            return df_filtrado.iloc[0:0]
+        if "codigo_vendedor" in df_filtrado.columns:
+            return df_filtrado[df_filtrado["codigo_vendedor"] == int(owner)].copy()
+        return df_filtrado.iloc[0:0]
+
+    return df_filtrado
