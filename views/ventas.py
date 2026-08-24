@@ -68,6 +68,14 @@ if df_seguro.empty:
 rol = st.session_state.get("rol_actual", "comercial")
 branch_usuario = str(st.session_state.get("sap_branch_code", "")).strip().upper()
 
+# Mapa para normalizar nombres de almacén
+mapa_inverso = {
+    "EJECUTIVOS COMERCIALES": "EJECOM", "PUNTO 134": "ALM134", "7 DE AGOSTO": "7AGOS", 
+    "AVENIDA19": "AV19", "CENTRO 1": "Q1", "CENTRO 3": "Q3", "CENTRO 5": "Q5", "CENTRO 6": "Q6",
+    "PUNTO170": "ALM170", "NORTE128": "ALM128", "VILLAVICENCIO": "VILL", "ARMENIA": "ARME", "CHIA": "CHIA"
+}
+branch_corto = mapa_inverso.get(branch_usuario, branch_usuario)
+
 # ============================================================
 # BANDERAS DE ROL
 # ============================================================
@@ -83,7 +91,7 @@ st.title("Dashboard de Ventas vs Metas")
 if es_gerencial:
     st.success("Vista corporativa completa")
 elif es_admin_punto:
-    st.success(f"Vista del punto de venta: {branch_usuario or 'N/A'}")
+    st.success(f"Vista del punto de venta: {branch_corto or 'N/A'}")
 else:
     st.info("Viendo únicamente tus ventas asignadas")
 
@@ -169,8 +177,13 @@ if es_gerencial:
 elif es_admin_punto:
     modo_vista = "puntos"
 elif es_comercial:
-    if branch_usuario == ALMACEN_EJECUTIVOS:
-        modo_vista = "ejecutivos"
+    # ✅ DETECCIÓN INFALIBLE: Basada en los datos reales filtrados por RLS, no en la configuración del usuario
+    if not df.empty and "Almacen_Corto" in df.columns:
+        almacen_real = str(df["Almacen_Corto"].mode()[0]).upper()
+        if ALMACEN_EJECUTIVOS in almacen_real:
+            modo_vista = "ejecutivos"
+        else:
+            modo_vista = "puntos"
     else:
         modo_vista = "puntos"
 else:
@@ -183,6 +196,18 @@ if st.session_state.ultimo_modo_vista != modo_vista:
     st.session_state.clicked_mes_ventas = None
     st.session_state.ultimo_modo_vista = modo_vista
     st.rerun()
+
+# ============================================================
+# 🔧 FIX: ACOTAR EL UNIVERSO DE DATOS AL ALMACÉN "EJECOM" EN MODO EJECUTIVOS
+# ------------------------------------------------------------
+# Antes, al elegir "Ejecutivos Comerciales" (gerencial/admin) se agrupaba
+# TODO el dataframe filtrado (todos los puntos de venta) por vendedor, así
+# que cualquier vendedor de cualquier almacén aparecía comparado contra la
+# meta de 430M. Esto también mantiene coherentes la tendencia mensual, la
+# tabla de resumen y el detalle de documentos con el modo seleccionado.
+# ============================================================
+if modo_vista == "ejecutivos" and "Almacen_Corto" in df.columns:
+    df = df[df["Almacen_Corto"].astype(str).str.upper() == ALMACEN_EJECUTIVOS]
 
 # ============================================================
 # APLICAR FILTROS DINÁMICOS (Drill-down en cascada)
@@ -201,30 +226,43 @@ if df.empty:
     st.warning("No hay datos de ventas con los filtros actuales.")
     st.stop()
 
-# ✅ CAMBIO 3: Calcular meses reales para la meta (respeta filtros dinámicos)
 meses_reales_en_df = df["Mes_Texto"].dropna().unique() if "Mes_Texto" in df.columns else []
 num_meses_para_meta = len(meses_reales_en_df) if len(meses_reales_en_df) > 0 else 1
 
 meta_punto_ajustada = META_PUNTO_VENTA_MENSUAL * num_meses_para_meta
 meta_ejecutivo_ajustada = META_EJECUTIVO_MENSUAL * num_meses_para_meta
 
-# ✅ CAMBIO 2: Filtrar estrictamente a EJECOM cuando el modo es ejecutivos
-if modo_vista == "ejecutivos":
-    df_ejecom = df[df["Almacen_Corto"] == ALMACEN_EJECUTIVOS]
-    if df_ejecom.empty:
-        st.warning(f"No hay datos del almacén {ALMACEN_EJECUTIVOS} con los filtros actuales.")
-        st.stop()
-    
-    df_grupo = df_ejecom.groupby("nombre_vendedor").agg(
+if st.session_state.clicked_vendedor_ventas and modo_vista in ("puntos", "ejecutivos"):
+    # ✅ VISTA DE TOP 20 CLIENTES (Activada por toggle)
+    # 🔧 FIX: antes exigía modo_vista == "puntos", así que un comercial de
+    # EJECOM (modo "ejecutivos") nunca llegaba aquí al hacer clic en su
+    # propia barra: la condición "modo_vista == 'ejecutivos'" de abajo se
+    # evaluaba primero y se quedaba ahí. Ahora esta vista tiene prioridad
+    # en ambos modos, igual que ya ocurría para el resto de roles.
+    df_grupo = df.groupby("nombre_cliente").agg(
+        Ventas=("precio_sin_iva", "sum"),
+        Rentabilidad=("rentabilidad", "sum")
+    ).reset_index()
+    df_grupo = df_grupo.rename(columns={"nombre_cliente": "Entidad"})
+    df_grupo = df_grupo.sort_values("Ventas", ascending=False).head(20)
+    df_grupo["Meta"] = 0
+    titulo_grafico = f"Top 20 Clientes de: {st.session_state.clicked_vendedor_ventas}"
+    etiqueta_entidad = "Cliente"
+    nivel_drill = "cliente"
+
+elif modo_vista == "ejecutivos":
+    # ✅ Para comerciales de EJECOM, usamos sus datos directamente (ya filtrados por RLS)
+    # Esto evita fallos si el nombre del almacén tiene variaciones de texto en la BD
+    df_grupo = df.groupby("nombre_vendedor").agg(
         Ventas=("precio_sin_iva", "sum"),
         Rentabilidad=("rentabilidad", "sum")
     ).reset_index()
     df_grupo = df_grupo.rename(columns={"nombre_vendedor": "Entidad"})
-    df_grupo["Meta"] = meta_ejecutivo_ajustada
+    df_grupo["Meta"] = meta_ejecutivo_ajustada  # Aplica la meta de 430M * meses
     titulo_grafico = "Ventas vs Meta por Ejecutivo Comercial"
     etiqueta_entidad = "Ejecutivo"
     nivel_drill = "vendedor"
-    
+
 elif st.session_state.clicked_almacen_ventas and modo_vista == "puntos":
     df_grupo = df.groupby("nombre_vendedor").agg(
         Ventas=("precio_sin_iva", "sum"),
@@ -236,19 +274,8 @@ elif st.session_state.clicked_almacen_ventas and modo_vista == "puntos":
     etiqueta_entidad = "Vendedor"
     nivel_drill = "vendedor"
     
-elif st.session_state.clicked_vendedor_ventas and modo_vista == "puntos":
-    df_grupo = df.groupby("nombre_cliente").agg(
-        Ventas=("precio_sin_iva", "sum"),
-        Rentabilidad=("rentabilidad", "sum")
-    ).reset_index()
-    df_grupo = df_grupo.rename(columns={"nombre_cliente": "Entidad"})
-    df_grupo = df_grupo.sort_values("Ventas", ascending=False).head(20)
-    df_grupo["Meta"] = 0
-    titulo_grafico = f"Top 20 Clientes de: {st.session_state.clicked_vendedor_ventas}"
-    etiqueta_entidad = "Cliente"
-    nivel_drill = "cliente"
-    
 else:
+    # ✅ VISTA PRINCIPAL (Tus Ventas vs Meta del Almacén)
     df_grupo = df.groupby("Almacen_Corto").agg(
         Ventas=("precio_sin_iva", "sum"),
         Rentabilidad=("rentabilidad", "sum")
@@ -256,8 +283,8 @@ else:
     df_grupo = df_grupo.rename(columns={"Almacen_Corto": "Entidad"})
     df_grupo["Meta"] = meta_punto_ajustada
     
-    if es_comercial and branch_usuario != ALMACEN_EJECUTIVOS:
-        titulo_grafico = f"Tus Ventas vs Meta del Almacén ({branch_usuario})"
+    if es_comercial:
+        titulo_grafico = f"Tus Ventas vs Meta del Almacén ({branch_corto})"
     else:
         titulo_grafico = "Ventas vs Meta por Punto de Venta"
         
@@ -280,15 +307,43 @@ df_grupo["Estado"] = df_grupo["% Cumplimiento"].apply(
 df_grupo = df_grupo.sort_values("Ventas", ascending=False)
 
 # ============================================================
+# 🔧 FIX: UTILIDAD ANTI-BUCLE PARA GRÁFICOS INTERACTIVOS
+# ------------------------------------------------------------
+# st.plotly_chart(..., on_select="rerun") conserva la selección del punto
+# clicado entre reruns. Como el código reaccionaba a "event.selection.points"
+# directamente y llamaba a st.rerun() de nuevo, cada vez que el gráfico se
+# volvía a dibujar CON LOS MISMOS DATOS (p. ej. la vista "Ejecutivos
+# Comerciales" de un comercial de EJECOM, que solo tiene una barra: la suya)
+# Streamlit seguía "viendo" el mismo clic y volvía a alternar el filtro
+# (on/off/on/off...) por siempre → el bucle infinito reportado.
+# Esta función solo deja pasar una selección si es distinta a la última que
+# ya se procesó para esa clave; si no hay selección, limpia la firma para
+# permitir volver a hacer clic sobre la misma barra más adelante.
+# ============================================================
+def procesar_clic_grafico(event, clave_firma: str):
+    if not (event and event.selection and event.selection.points):
+        st.session_state[clave_firma] = None
+        return None
+
+    punto = event.selection.points[0]
+    firma_actual = f"{punto.get('x')}|{punto.get('y')}|{punto.get('curveNumber')}"
+
+    if st.session_state.get(clave_firma) == firma_actual:
+        return None  # Ya se procesó este clic en un rerun anterior
+
+    st.session_state[clave_firma] = firma_actual
+    return punto
+
+# ============================================================
 # KPIs GENERALES
 # ============================================================
 total_ventas = df_grupo["Ventas"].sum()
 total_meta = df_grupo["Meta"].sum()
 cumplimiento_global = (total_ventas / total_meta * 100) if total_meta > 0 else 0
+entidades = df_grupo["Entidad"].nunique()
+entidades_cumplen = (df_grupo["% Cumplimiento"] >= 100).sum()
 
 if es_gerencial:
-    entidades = df_grupo["Entidad"].nunique()
-    entidades_cumplen = (df_grupo["% Cumplimiento"] >= 100).sum()
     kpi_cols = st.columns(4)
     with kpi_cols[0].container(border=True, height=130):
         st.metric("Ventas Totales", value=f"${total_ventas:,.0f}")
@@ -351,15 +406,43 @@ fig.update_yaxes(tickformat="$,.0f")
 
 event = st.plotly_chart(fig, use_container_width=True, config=PLOTLY_CONFIG, key="chart_ventas_main", on_select="rerun")
 
-if event and event.selection and event.selection.points:
-    entidad_seleccionada = event.selection.points[0].get('x')
+# ============================================================
+# 🔧 LÓGICA DE TOGGLE ESTABLE (guard anti-bucle aplicado)
+# ============================================================
+punto_click_main = procesar_clic_grafico(event, "_firma_click_main_ventas")
+if punto_click_main:
+    entidad_seleccionada = punto_click_main.get('x')
+    
     if nivel_drill == "almacen":
-        st.session_state.clicked_almacen_ventas = None if st.session_state.clicked_almacen_ventas == entidad_seleccionada else entidad_seleccionada
-        st.session_state.clicked_vendedor_ventas = None
+        if es_comercial:
+            # ✅ TOGGLE DIRECTO PARA COMERCIALES: Clic en "Tus Ventas" muestra sus clientes
+            if st.session_state.clicked_vendedor_ventas:
+                st.session_state.clicked_vendedor_ventas = None # Desactivar
+            else:
+                vendedores_unicos = df["nombre_vendedor"].dropna().unique()
+                if len(vendedores_unicos) > 0:
+                    st.session_state.clicked_vendedor_ventas = str(vendedores_unicos[0])
+        else:
+            # Lógica normal para admin/gerente
+            if st.session_state.clicked_almacen_ventas == entidad_seleccionada:
+                st.session_state.clicked_almacen_ventas = None
+            else:
+                st.session_state.clicked_almacen_ventas = entidad_seleccionada
+            st.session_state.clicked_vendedor_ventas = None
         st.rerun()
+        
     elif nivel_drill == "vendedor":
-        st.session_state.clicked_vendedor_ventas = None if st.session_state.clicked_vendedor_ventas == entidad_seleccionada else entidad_seleccionada
+        if st.session_state.clicked_vendedor_ventas == entidad_seleccionada:
+            st.session_state.clicked_vendedor_ventas = None
+        else:
+            st.session_state.clicked_vendedor_ventas = entidad_seleccionada
         st.rerun()
+        
+    elif nivel_drill == "cliente":
+        # ✅ CORRECCIÓN CLAVE: Permite al comercial volver a la vista principal al hacer clic en el gráfico de clientes
+        if es_comercial:
+            st.session_state.clicked_vendedor_ventas = None
+            st.rerun()
 
 # ============================================================
 # GRÁFICO DE TENDENCIA MENSUAL (INTERACTIVO)
@@ -399,8 +482,9 @@ fig_mensual.update_yaxes(tickformat="$,.0f")
 
 event_mensual = st.plotly_chart(fig_mensual, use_container_width=True, config=PLOTLY_CONFIG, key="chart_mensual_ventas", on_select="rerun")
 
-if event_mensual and event_mensual.selection and event_mensual.selection.points:
-    mes_seleccionado = event_mensual.selection.points[0].get('x')
+punto_click_mensual = procesar_clic_grafico(event_mensual, "_firma_click_mensual_ventas")
+if punto_click_mensual:
+    mes_seleccionado = punto_click_mensual.get('x')
     if st.session_state.clicked_mes_ventas == mes_seleccionado:
         st.session_state.clicked_mes_ventas = None
     else:
@@ -408,10 +492,9 @@ if event_mensual and event_mensual.selection and event_mensual.selection.points:
     st.rerun()
 
 # ============================================================
-# GRÁFICO DE VENTAS POR COLABORADOR (INTERACTIVO)
+# GRÁFICO DE VENTAS POR COLABORADOR (SOLO GERENCIAL Y ADMIN PUNTO)
 # ============================================================
-# ✅ CAMBIO 1: Agregado es_comercial para que también vea este gráfico y sus Top 20 clientes
-if (es_gerencial or es_admin_punto or es_comercial) and modo_vista == "puntos" and not st.session_state.clicked_vendedor_ventas:
+if (es_gerencial or es_admin_punto) and modo_vista == "puntos":
     st.markdown("---")
     st.subheader("Ventas por Colaborador")
     
@@ -456,8 +539,9 @@ if (es_gerencial or es_admin_punto or es_comercial) and modo_vista == "puntos" a
         
         event_col = st.plotly_chart(fig_col, use_container_width=True, config=PLOTLY_CONFIG, key="chart_colaboradores_ventas", on_select="rerun")
         
-        if event_col and event_col.selection and event_col.selection.points:
-            label_seleccionado = event_col.selection.points[0].get('y')
+        punto_click_col = procesar_clic_grafico(event_col, "_firma_click_colaboradores_ventas")
+        if punto_click_col:
+            label_seleccionado = punto_click_col.get('y')
             nombre_colab = label_seleccionado.split(' (')[0].strip() if ' (' in label_seleccionado else label_seleccionado
             
             if st.session_state.clicked_vendedor_ventas == nombre_colab:

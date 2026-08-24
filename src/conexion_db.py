@@ -168,8 +168,6 @@ def ejecutar_sincronizacion_desde_sap():
 
         # ============================================================
         # 🆕 NUEVO QUERY: VENTAS NETAS (Facturas - Notas Crédito)
-        # Período de prueba: últimos 3 meses
-        # Para producción: cambiar ADD_MONTHS(CURRENT_DATE, -3) por TO_DATE('2025-04-01','YYYY-MM-DD')
         # ============================================================
         query_ventas_netas = """
             SELECT
@@ -217,7 +215,7 @@ def ejecutar_sincronizacion_desde_sap():
             LEFT JOIN "NE042025".OHEM T8 ON T7."INTERNAL_K" = T8."empID"
             WHERE
                 T0."CANCELED" = 'N'
-                AND T0."DocDate" >= ADD_MONTHS(CURRENT_DATE, -5)
+                AND T0."DocDate" >= ADD_MONTHS(CURRENT_DATE, -6)
                 AND T0."DocDate" <= CURRENT_DATE
                 AND (T3."SeriesName" IS NULL 
                      OR T3."SeriesName" NOT IN ('INGE','NDFINGEN','INGF','NCINGEN.','ND-INGEN','NPINGEN','FactClie','RC-INGEN'))
@@ -270,7 +268,7 @@ def ejecutar_sincronizacion_desde_sap():
             LEFT JOIN "NE042025".OHEM T8 ON T7."INTERNAL_K" = T8."empID"
             WHERE
                 T0."CANCELED" = 'N'
-                AND T0."DocDate" >= ADD_MONTHS(CURRENT_DATE, -5)
+                AND T0."DocDate" >= ADD_MONTHS(CURRENT_DATE, -6)
                 AND T0."DocDate" <= CURRENT_DATE
                 AND (T3."SeriesName" IS NULL 
                      OR T3."SeriesName" NOT IN ('INGE','NDFINGEN','INGF','NCINGEN.','ND-INGEN','NPINGEN','FactClie','RC-INGEN'))
@@ -288,7 +286,7 @@ def ejecutar_sincronizacion_desde_sap():
         df_traslados = pd.read_sql(query_traslados, conexion_sap)
         df_facturas = pd.read_sql(query_facturas, conexion_sap)
         df_notas = pd.read_sql(query_notas, conexion_sap)
-        df_ventas_netas = pd.read_sql(query_ventas_netas, conexion_sap)  # 🆕
+        df_ventas_netas = pd.read_sql(query_ventas_netas, conexion_sap)
 
         conexion_sap.close()
 
@@ -297,7 +295,6 @@ def ejecutar_sincronizacion_desde_sap():
         # ============================================================
         pg_engine = create_engine(CADENA_CONEXION_PG)
 
-        # SQL para crear vistas con rangos de días
         sql_vista_rem = """CREATE OR REPLACE VIEW sap_raw.vw_remisiones_con_rangos AS SELECT r.*, sap_raw.calcular_rango_dias(r."Fecha_Contabilizacion"::date) AS "Rango_Dias" FROM sap_raw.remisiones r;"""
         sql_vista_cot = """CREATE OR REPLACE VIEW sap_raw.vw_cotizaciones_con_rangos AS SELECT c.*, sap_raw.calcular_rango_dias(c."Fecha_Contabilizacion"::date) AS "Rango_Dias" FROM sap_raw.cotizaciones c;"""
         sql_vista_ord = """CREATE OR REPLACE VIEW sap_raw.vw_ordenes_venta_con_rangos AS SELECT o.*, sap_raw.calcular_rango_dias(o."Fecha_Contabilizacion"::date) AS "Rango_Dias" FROM sap_raw.ordenes_venta o;"""
@@ -305,10 +302,8 @@ def ejecutar_sincronizacion_desde_sap():
         sql_vista_tra = """CREATE OR REPLACE VIEW sap_raw.vw_solicitudes_traslados_con_rangos AS SELECT s.*, sap_raw.calcular_rango_dias(s."Fecha_Contabilizacion"::date) AS "Rango_Dias" FROM sap_raw.solicitudes_traslados s;"""
         sql_vista_fac = """CREATE OR REPLACE VIEW sap_raw.vw_facturas_reserva_con_rangos AS SELECT f.*, sap_raw.calcular_rango_dias(f."Fecha_Contabilizacion"::date) AS "Rango_Dias" FROM sap_raw.facturas_reserva f;"""
         sql_vista_nc = """CREATE OR REPLACE VIEW sap_raw.vw_notas_credito_con_rangos AS SELECT n.*, sap_raw.calcular_rango_dias(n."Fecha_Contabilizacion"::date) AS "Rango_Dias" FROM sap_raw.notas_credito n;"""
-        # 🆕 Vista para ventas netas (usa la misma función calcular_rango_dias)
         sql_vista_ventas = """CREATE OR REPLACE VIEW sap_raw.vw_ventas_netas_con_rangos AS SELECT v.*, sap_raw.calcular_rango_dias(v."fecha_contabilizacion"::date) AS "Rango_Dias" FROM sap_raw.ventas_netas v;"""
 
-        # Eliminar vistas existentes antes de recrearlas
         with pg_engine.begin() as pg_conn:
             pg_conn.execute(text("DROP VIEW IF EXISTS sap_raw.vw_remisiones_con_rangos CASCADE;"))
             pg_conn.execute(text("DROP VIEW IF EXISTS sap_raw.vw_cotizaciones_con_rangos CASCADE;"))
@@ -317,9 +312,8 @@ def ejecutar_sincronizacion_desde_sap():
             pg_conn.execute(text("DROP VIEW IF EXISTS sap_raw.vw_solicitudes_traslados_con_rangos CASCADE;"))
             pg_conn.execute(text("DROP VIEW IF EXISTS sap_raw.vw_facturas_reserva_con_rangos CASCADE;"))
             pg_conn.execute(text("DROP VIEW IF EXISTS sap_raw.vw_notas_credito_con_rangos CASCADE;"))
-            pg_conn.execute(text("DROP VIEW IF EXISTS sap_raw.vw_ventas_netas_con_rangos CASCADE;"))  # 🆕
+            pg_conn.execute(text("DROP VIEW IF EXISTS sap_raw.vw_ventas_netas_con_rangos CASCADE;"))
 
-        # Cargar datos crudos en PostgreSQL
         df_remisiones.to_sql('remisiones', pg_engine, schema='sap_raw', if_exists='replace', index=False)
         df_colaboradores.to_sql('colaboradores', pg_engine, schema='sap_raw', if_exists='replace', index=False)
         df_cotizaciones.to_sql('cotizaciones', pg_engine, schema='sap_raw', if_exists='replace', index=False)
@@ -328,9 +322,8 @@ def ejecutar_sincronizacion_desde_sap():
         df_traslados.to_sql('solicitudes_traslados', pg_engine, schema='sap_raw', if_exists='replace', index=False)
         df_facturas.to_sql('facturas_reserva', pg_engine, schema='sap_raw', if_exists='replace', index=False)
         df_notas.to_sql('notas_credito', pg_engine, schema='sap_raw', if_exists='replace', index=False)
-        df_ventas_netas.to_sql('ventas_netas', pg_engine, schema='sap_raw', if_exists='replace', index=False)  # 🆕
+        df_ventas_netas.to_sql('ventas_netas', pg_engine, schema='sap_raw', if_exists='replace', index=False)
 
-        # Recrear vistas con Rango_Dias
         with pg_engine.begin() as pg_conn:
             pg_conn.execute(text(sql_vista_rem))
             pg_conn.execute(text(sql_vista_cot))
@@ -339,9 +332,8 @@ def ejecutar_sincronizacion_desde_sap():
             pg_conn.execute(text(sql_vista_tra))
             pg_conn.execute(text(sql_vista_fac))
             pg_conn.execute(text(sql_vista_nc))
-            pg_conn.execute(text(sql_vista_ventas))  # 🆕
+            pg_conn.execute(text(sql_vista_ventas))
 
-            # 🆕 Crear índices para optimizar el dashboard de ventas
             pg_conn.execute(text("CREATE INDEX IF NOT EXISTS idx_ventas_fecha ON sap_raw.ventas_netas (fecha_contabilizacion)"))
             pg_conn.execute(text("CREATE INDEX IF NOT EXISTS idx_ventas_almacen ON sap_raw.ventas_netas (codigo_almacen)"))
             pg_conn.execute(text("CREATE INDEX IF NOT EXISTS idx_ventas_vendedor ON sap_raw.ventas_netas (codigo_vendedor)"))
@@ -372,7 +364,6 @@ def cargar_y_transformar_remisiones():
         st.error(f"Error analizando datos en Postgres: {e}")
         return pd.DataFrame()
 
-
 @st.cache_data(ttl=600)
 def cargar_y_transformar_cotizaciones():
     try:
@@ -387,7 +378,6 @@ def cargar_y_transformar_cotizaciones():
     except Exception as e:
         st.error(f"Error analizando cotizaciones en Postgres: {e}")
         return pd.DataFrame()
-
 
 @st.cache_data(ttl=600)
 def cargar_y_transformar_ordenes():
@@ -404,7 +394,6 @@ def cargar_y_transformar_ordenes():
         st.error(f"Error analizando órdenes de venta en Postgres: {e}")
         return pd.DataFrame()
 
-
 @st.cache_data(ttl=600)
 def cargar_y_transformar_solicitudes():
     try:
@@ -419,7 +408,6 @@ def cargar_y_transformar_solicitudes():
     except Exception as e:
         st.error(f"Error analizando solicitudes en Postgres: {e}")
         return pd.DataFrame()
-
 
 @st.cache_data(ttl=600)
 def cargar_y_transformar_traslados():
@@ -439,7 +427,6 @@ def cargar_y_transformar_traslados():
     except Exception as e:
         st.error(f"Error analizando traslados en Postgres: {e}")
         return pd.DataFrame()
-
 
 @st.cache_data(ttl=600)
 def cargar_y_transformar_facturas():
@@ -461,7 +448,6 @@ def cargar_y_transformar_facturas():
         st.error(f"Error analizando facturas reserva en Postgres: {e}")
         return pd.DataFrame()
 
-
 @st.cache_data(ttl=600)
 def cargar_y_transformar_notas():
     try:
@@ -482,9 +468,8 @@ def cargar_y_transformar_notas():
         st.error(f"Error analizando notas crédito en Postgres: {e}")
         return pd.DataFrame()
 
-
 # ============================================================
-# 🆕 NUEVA FUNCIÓN: CARGA Y TRANSFORMACIÓN DE VENTAS NETAS
+#  FUNCIÓN: CARGA Y TRANSFORMACIÓN DE VENTAS NETAS
 # ============================================================
 @st.cache_data(ttl=600)
 def cargar_y_transformar_ventas():
@@ -494,14 +479,11 @@ def cargar_y_transformar_ventas():
         if df.empty:
             return pd.DataFrame()
 
-        # Estandarizar tipos
         df["fecha_contabilizacion"] = pd.to_datetime(df["fecha_contabilizacion"], errors="coerce")
         for col in ["precio_sin_iva", "costo_total", "rentabilidad"]:
             if col in df.columns:
                 df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0)
-        if "codigo_vendedor" in df.columns:
-            df["codigo_vendedor"] = pd.to_numeric(df["codigo_vendedor"], errors="coerce").fillna(0).astype(int)
-
+        
         # ✅ Asignación directa (el SQL ya trae códigos cortos)
         df["Almacen_Corto"] = df["nombre_almacen"]
         df["Mes_Texto"] = df["fecha_contabilizacion"].dt.strftime("%b %Y")
@@ -513,17 +495,24 @@ def cargar_y_transformar_ventas():
 
 
 # ============================================================
-# SEGURIDAD RLS (módulos existentes - remisiones, cotizaciones, etc.)
+# ✅ FUNCIÓN ORIGINAL: RLS GENERAL (Para Remisiones, Cotizaciones, etc.)
 # ============================================================
 def aplicar_seguridad_rls(df):
     import streamlit as st
-    if df is None or df.empty: return df
+    if df is None or df.empty: 
+        return df
     rol = st.session_state.get('rol_actual', 'comercial')
     df_filtrado = df.copy()
-    if 'Propietario_Doc' in df_filtrado.columns: df_filtrado['Propietario_Doc'] = df_filtrado['Propietario_Doc'].astype(str).str.strip()
-    if 'Empleado_Ventas' in df_filtrado.columns: df_filtrado['Empleado_Ventas'] = df_filtrado['Empleado_Ventas'].astype(str).str.strip()
-    if 'Sede_Codigo' in df_filtrado.columns: df_filtrado['Sede_Codigo'] = df_filtrado['Sede_Codigo'].astype(str).str.strip()
-    if rol in ["admin", "gerente", "gerente_comercial"]: return df_filtrado
+    
+    if 'Propietario_Doc' in df_filtrado.columns: 
+        df_filtrado['Propietario_Doc'] = df_filtrado['Propietario_Doc'].astype(str).str.strip()
+    if 'Empleado_Ventas' in df_filtrado.columns: 
+        df_filtrado['Empleado_Ventas'] = df_filtrado['Empleado_Ventas'].astype(str).str.strip()
+    if 'Sede_Codigo' in df_filtrado.columns: 
+        df_filtrado['Sede_Codigo'] = df_filtrado['Sede_Codigo'].astype(str).str.strip()
+        
+    if rol in ["admin", "gerente", "gerente_comercial"]: 
+        return df_filtrado
     elif rol == "admin_punto":
         sap_branch = st.session_state.get('sap_branch_code')
         if sap_branch and str(sap_branch).strip().lower() not in ['none', '']:
@@ -541,37 +530,84 @@ def aplicar_seguridad_rls(df):
 
 
 # ============================================================
-# 🆕 NUEVA FUNCIÓN: RLS ESPECÍFICO PARA VENTAS (Metas)
+# 🆕 FUNCIÓN: RLS ESPECÍFICO PARA VENTAS (Metas) - CORREGIDA FINAL
 # ============================================================
 def aplicar_seguridad_rls_ventas(df: pd.DataFrame) -> pd.DataFrame:
-    """RLS específico para el módulo de ventas con metas.
-    - admin/gerente: ve todo
-    - admin_punto: ve solo su almacén (por nombre_almacen)
-    - comercial: ve solo sus ventas (por codigo_vendedor)
-    """
+    """RLS específico para el módulo de ventas con metas."""
     if df is None or df.empty:
         return df
+    
     rol = st.session_state.get("rol_actual", "comercial")
     df_filtrado = df.copy()
 
+    # ✅ SOLUCIÓN DEFINITIVA: Limpieza robusta de códigos (maneja 466, 466.0, '466.0', etc.)
+    def clean_code(val):
+        if pd.isna(val):
+            return ''
+        try:
+            # Forzar a float primero para manejar strings como '466.0' o números
+            num = float(val)
+            if num.is_integer():
+                return str(int(num))  # Convierte 466.0 a '466'
+            return str(num)
+        except (ValueError, TypeError):
+            return str(val).strip()
+
+    # Aplicar limpieza a las columnas clave
+    if 'propietario_doc' in df_filtrado.columns:
+        df_filtrado['propietario_doc'] = df_filtrado['propietario_doc'].apply(clean_code)
+    if 'codigo_vendedor' in df_filtrado.columns:
+        df_filtrado['codigo_vendedor'] = df_filtrado['codigo_vendedor'].apply(clean_code)
+    if 'Almacen_Corto' in df_filtrado.columns:
+        df_filtrado['Almacen_Corto'] = df_filtrado['Almacen_Corto'].astype(str).str.strip().str.upper()
+
+    # Roles gerenciales ven todo
     if rol in ["admin", "gerente", "gerente_comercial"]:
         return df_filtrado
 
+    # ==========================================
+    # ROL: admin_punto (FILTRADO POR ALMACÉN)
+    # ==========================================
     if rol == "admin_punto":
-        branch = str(st.session_state.get("sap_branch_code", "")).strip()
-        if not branch or branch.lower() in ['none', '']:
+        sap_branch = st.session_state.get('sap_branch_code')
+        if sap_branch is None or str(sap_branch).strip().lower() in ['none', '', 'nan']:
             return df_filtrado.iloc[0:0]
-        # Filtrar por nombre_almacen (campo del nuevo query)
-        if "nombre_almacen" in df_filtrado.columns:
-            return df_filtrado[df_filtrado["nombre_almacen"].str.upper().str.strip() == branch.upper()].copy()
+        
+        branch_str = str(sap_branch).strip().upper()
+        mapa_inverso = {
+            "EJECUTIVOS COMERCIALES": "EJECOM", "PUNTO 134": "ALM134", "7 DE AGOSTO": "7AGOS", 
+            "AVENIDA19": "AV19", "CENTRO 1": "Q1", "CENTRO 3": "Q3", "CENTRO 5": "Q5", "CENTRO 6": "Q6",
+            "PUNTO170": "ALM170", "NORTE128": "ALM128", "VILLAVICENCIO": "VILL", "ARMENIA": "ARME", "CHIA": "CHIA"
+        }
+        codigo_corto = mapa_inverso.get(branch_str, branch_str)
+        
+        if 'Almacen_Corto' in df_filtrado.columns:
+            return df_filtrado[df_filtrado['Almacen_Corto'] == codigo_corto].copy()
         return df_filtrado.iloc[0:0]
 
-    if rol == "comercial":
-        owner = st.session_state.get("sap_owner_code")
-        if owner is None or str(owner).strip() == "" or str(owner).strip().lower() == "none":
+    # ==========================================
+    # ROL: comercial (FILTRADO ESTRICTO POR PROPIETARIO_DOC, IGUAL QUE POWER BI)
+    # ==========================================
+    elif rol == "comercial":
+        sap_owner_raw = st.session_state.get('sap_owner_code')
+        
+        if sap_owner_raw is None:
             return df_filtrado.iloc[0:0]
-        if "codigo_vendedor" in df_filtrado.columns:
-            return df_filtrado[df_filtrado["codigo_vendedor"] == int(owner)].copy()
-        return df_filtrado.iloc[0:0]
+        
+        sap_owner_clean = clean_code(sap_owner_raw)
+        
+        if not sap_owner_clean or sap_owner_clean.lower() in ['none', 'nan', '']:
+            return df_filtrado.iloc[0:0]
+        
+        # ✅ CORRECCIÓN CRÍTICA: Filtrar SOLO por propietario_doc. 
+        # Se eliminó por completo el operador OR con codigo_vendedor.
+        # Esto evita que aparezcan documentos de otros almacenes (ej. VILL) 
+        # solo porque el comercial los creó (OwnerCode), respetando la lógica de Power BI.
+        if 'propietario_doc' in df_filtrado.columns:
+            df_resultado = df_filtrado[df_filtrado['propietario_doc'] == sap_owner_clean].copy()
+        else:
+            df_resultado = df_filtrado.iloc[0:0]
+        
+        return df_resultado
 
     return df_filtrado
