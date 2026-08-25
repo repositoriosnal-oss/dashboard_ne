@@ -215,7 +215,7 @@ def ejecutar_sincronizacion_desde_sap():
             LEFT JOIN "NE042025".OHEM T8 ON T7."INTERNAL_K" = T8."empID"
             WHERE
                 T0."CANCELED" = 'N'
-                AND T0."DocDate" >= ADD_MONTHS(CURRENT_DATE, -6)
+                AND T0."DocDate" >= ADD_MONTHS(CURRENT_DATE, -3)
                 AND T0."DocDate" <= CURRENT_DATE
                 AND (T3."SeriesName" IS NULL 
                      OR T3."SeriesName" NOT IN ('INGE','NDFINGEN','INGF','NCINGEN.','ND-INGEN','NPINGEN','FactClie','RC-INGEN'))
@@ -268,7 +268,7 @@ def ejecutar_sincronizacion_desde_sap():
             LEFT JOIN "NE042025".OHEM T8 ON T7."INTERNAL_K" = T8."empID"
             WHERE
                 T0."CANCELED" = 'N'
-                AND T0."DocDate" >= ADD_MONTHS(CURRENT_DATE, -6)
+                AND T0."DocDate" >= ADD_MONTHS(CURRENT_DATE, -3)
                 AND T0."DocDate" <= CURRENT_DATE
                 AND (T3."SeriesName" IS NULL 
                      OR T3."SeriesName" NOT IN ('INGE','NDFINGEN','INGF','NCINGEN.','ND-INGEN','NPINGEN','FactClie','RC-INGEN'))
