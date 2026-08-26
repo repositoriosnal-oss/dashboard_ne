@@ -60,7 +60,7 @@ def cargar_datos():
 df_completo = cargar_datos()
 df_seguro = aplicar_seguridad_rls_ventas(df_completo)
 
-# ==========================================
+# ========================================== a
 # 🔍 MODO DIAGNÓSTICO DE PRODUCCIÓN (SOLO PARA ESTE TEST)
 # ==========================================
 #rol = st.session_state.get("rol_actual", "comercial")
