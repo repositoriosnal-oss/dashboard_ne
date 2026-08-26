@@ -55,8 +55,41 @@ ALMACEN_EJECUTIVOS = "EJECOM"
 def cargar_datos():
     return cargar_y_transformar_ventas()
 
+# ... (código anterior de imports y carga de datos) ...
+
 df_completo = cargar_datos()
 df_seguro = aplicar_seguridad_rls_ventas(df_completo)
+
+# ==========================================
+# 🔍 MODO DIAGNÓSTICO DE PRODUCCIÓN (SOLO PARA ESTE TEST)
+# ==========================================
+rol = st.session_state.get("rol_actual", "comercial")
+if rol in ["comercial", "admin_punto"]:
+    st.warning("🔍 MODO DIAGNÓSTICO DE PRODUCCIÓN ACTIVADO")
+    
+    st.markdown("### 1. Datos de la Sesión del Usuario (Lo que trajo el Login)")
+    st.write(f"- **Rol:** `{rol}`")
+    st.write(f"- **sap_branch_code:** `{st.session_state.get('sap_branch_code')}` (tipo: {type(st.session_state.get('sap_branch_code')).__name__})")
+    st.write(f"- **sap_owner_code:** `{st.session_state.get('sap_owner_code')}` (tipo: {type(st.session_state.get('sap_owner_code')).__name__})")
+    
+    st.markdown("### 2. Estado del DataFrame ANTES del filtro RLS (`df_completo`)")
+    st.write(f"- **Total filas en df_completo:** {len(df_completo)}")
+    if not df_completo.empty:
+        if 'Almacen_Corto' in df_completo.columns:
+            st.write("- **Valores únicos de `Almacen_Corto` (primeros 10):**", df_completo['Almacen_Corto'].dropna().astype(str).str.strip().unique().tolist()[:10])
+        if 'propietario_doc' in df_completo.columns:
+            st.write("- **Valores únicos de `propietario_doc` (primeros 10):**", df_completo['propietario_doc'].dropna().astype(str).str.strip().unique().tolist()[:10])
+        if 'codigo_vendedor' in df_completo.columns:
+            st.write("- **Valores únicos de `codigo_vendedor` (primeros 10):**", df_completo['codigo_vendedor'].dropna().astype(str).str.strip().unique().tolist()[:10])
+
+    st.markdown("### 3. Resultado DESPUÉS del filtro RLS (`df_seguro`)")
+    st.write(f"- **Total filas en df_seguro:** {len(df_seguro)}")
+    
+    if len(df_seguro) == 0 and len(df_completo) > 0:
+        st.error("❌ EL FILTRO RLS ESTÁ ELIMINANDO TODAS LAS FILAS.")
+        st.info("💡 Compara los valores del 'Paso 1' con los del 'Paso 2'. Si no son idénticos (incluyendo espacios o mayúsculas), esa es la causa.")
+    st.markdown("---")
+# ==========================================
 
 if df_seguro.empty:
     df_seguro = pd.DataFrame(columns=[
