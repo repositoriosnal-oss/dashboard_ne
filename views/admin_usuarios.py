@@ -37,7 +37,7 @@ tab_crear, tab_masiva, tab_editar, tab_reset = st.tabs([
 ])
 
 # --------------------------------------------------
-# PESTAÑA 1: CREAR USUARIO
+# PESTAÑA 1: CREAR USUARIO (LÓGICA DINÁMICA MEJORADA)
 # --------------------------------------------------
 with tab_crear:
     st.subheader("Registrar Nuevo Miembro en Plataforma")
@@ -61,6 +61,7 @@ with tab_crear:
             st.info(f"💡 Se asignará el almacén: **{sap_branch}**")
             
         elif rol_seleccionado == "comercial" and almacen_sel != "Seleccione un almacén...":
+            # ✅ MEJORA EXPERTA: Carga dinámica de colaboradores SOLO del almacén seleccionado
             with st.spinner("Cargando colaboradores activos en este almacén..."):
                 query_colab = """
                     SELECT DISTINCT "Colaborador", "Empleado_Ventas" AS "Codigo"
@@ -85,6 +86,7 @@ with tab_crear:
                 sap_owner = int(dict_comerciales_dinamico[colab_sel])
                 st.success(f"✅ Vinculado correctamente con código SAP: **{sap_owner}**")
 
+    # Obtener contraseña por defecto desde secrets (o fallback si no está configurado)
     default_pwd = st.secrets.get("default_password", "Sistemas2026*")
     st.caption(f"🔑 Contraseña provisional por defecto: **{default_pwd}**")
 
@@ -117,7 +119,7 @@ with tab_crear:
                 st.error(f"❌ El usuario ya existe o hubo un error de base de datos: {e}")
 
 # --------------------------------------------------
-# PESTAÑA 2: CARGA MASIVA DESDE EXCEL (MEJORADA PARA PRODUCCIÓN)
+# PESTAÑA 2: CARGA MASIVA DESDE EXCEL
 # --------------------------------------------------
 with tab_masiva:
     st.subheader("📥 Cargar Usuarios desde Archivo Excel")
@@ -139,10 +141,6 @@ with tab_masiva:
     if uploaded_file is not None:
         try:
             df_carga = pd.read_excel(uploaded_file)
-            
-            # ✅ MEJORA 1: Limpiar nombres de columnas (quita espacios y pasa a minúsculas)
-            df_carga.columns = [str(col).strip().lower() for col in df_carga.columns]
-            
             st.write("Vista previa de los datos a cargar:")
             st.dataframe(df_carga.head(), use_container_width=True)
             
@@ -152,26 +150,14 @@ with tab_masiva:
             else:
                 if st.button("🚀 Procesar Carga Masiva", type="primary"):
                     exitos, errores = 0, 0
-                    lista_errores_detalle = [] # ✅ MEJORA 2: Guardar errores para mostrarlos
-                    
                     with conn.session as session:
                         for index, row in df_carga.iterrows():
                             usuario = str(row['usuario']).strip().lower()
                             if pd.isna(usuario) or usuario == "":
                                 continue
                             try:
-                                # Limpieza robusta de branch
-                                raw_branch = row.get('sap_branch_code')
-                                branch = str(raw_branch).strip() if pd.notna(raw_branch) and str(raw_branch).strip().lower() not in ['nan', 'none', ''] else None
-                                
-                                # ✅ MEJORA 3: Manejo robusto de códigos que Excel lee como float (ej: 466.0)
-                                raw_owner = row.get('sap_owner_code')
-                                owner = None
-                                if pd.notna(raw_owner):
-                                    try:
-                                        owner = int(float(str(raw_owner).strip()))
-                                    except (ValueError, TypeError):
-                                        owner = None
+                                branch = str(row.get('sap_branch_code', '')).strip() if pd.notna(row.get('sap_branch_code')) else None
+                                owner = int(row.get('sap_owner_code')) if pd.notna(row.get('sap_owner_code')) and str(row.get('sap_owner_code')).replace('.', '', 1).isdigit() else None
                                 
                                 session.execute(text("""
                                     INSERT INTO app.usuarios_portal (usuario, clave, nombre_completo, rol, departamento, sap_owner_code, sap_branch_code, activo)
@@ -187,24 +173,11 @@ with tab_masiva:
                                     "branch": branch
                                 })
                                 exitos += 1
-                            except Exception as e:
+                            except Exception:
                                 errores += 1
-                                # Guardamos los primeros 3 errores para no saturar la pantalla
-                                if len(lista_errores_detalle) < 3:
-                                    lista_errores_detalle.append(f"Fila {index + 2} (Usuario: {usuario}): {str(e)}")
                                 continue
-                        
                         session.commit()
-                    
-                    st.success(f"✅ Proceso finalizado. **{exitos}** usuarios procesados. **{errores}** omitidos.")
-                    
-                    # ✅ MEJORA 4: Mostrar los errores reales si los hay
-                    if errores > 0 and lista_errores_detalle:
-                        st.warning("⚠️ **Detalles de los errores encontrados:**")
-                        for err in lista_errores_detalle:
-                            st.code(err, language="text")
-                        st.info("💡 Revisa que los nombres de las columnas en el Excel no tengan espacios al final y que los códigos sean números válidos.")
-                    
+                    st.success(f"✅ Proceso finalizado. **{exitos}** usuarios procesados. **{errores}** omitidos (posiblemente duplicados o datos inválidos).")
                     st.rerun()
         except Exception as e:
             st.error(f"❌ Error al leer el archivo: {e}")
