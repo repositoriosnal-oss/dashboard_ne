@@ -20,10 +20,13 @@ if st.session_state.get('rol_actual') != "admin":
 # 1. OBTENER DATOS MAESTROS (Almacenes)
 # ==========================================
 try:
-    df_almacenes = conn.query('SELECT DISTINCT "Almacen" FROM sap_raw.remisiones WHERE "Almacen" IS NOT NULL ORDER BY "Almacen"', ttl=0)
+    df_almacenes = conn.query(
+        'SELECT DISTINCT "Almacen" FROM sap_raw.remisiones WHERE "Almacen" IS NOT NULL ORDER BY "Almacen"', 
+        ttl=0
+    )
     lista_almacenes = ["Seleccione un almacén..."] + df_almacenes['Almacen'].tolist() if not df_almacenes.empty else ["No hay almacenes"]
 except Exception as e:
-    st.error(f"⚠️ Error al conectar con las tablas maestras: {e}")
+    st.error(f"️ Error al conectar con las tablas maestras: {e}")
     lista_almacenes = ["Error al cargar"]
 
 # ==========================================
@@ -37,7 +40,7 @@ tab_crear, tab_masiva, tab_editar, tab_reset = st.tabs([
 ])
 
 # --------------------------------------------------
-# PESTAÑA 1: CREAR USUARIO (LÓGICA DINÁMICA MEJORADA)
+# PESTAÑA 1: CREAR USUARIO
 # --------------------------------------------------
 with tab_crear:
     st.subheader("Registrar Nuevo Miembro en Plataforma")
@@ -46,11 +49,24 @@ with tab_crear:
     with col1:
         nuevo_usuario = st.text_input("Usuario de Acceso (Ej: juan.perez)").strip().lower()
         nombre_visible = st.text_input("Nombre Completo")
-        rol_seleccionado = st.selectbox("Rol de Seguridad", ["comercial", "admin_punto", "gerente_comercial", "gerente", "admin"])
+        rol_seleccionado = st.selectbox(
+            "Rol de Seguridad", 
+            ["comercial", "admin_punto", "gerente_comercial", "gerente", "admin"]
+        )
         
     with col2:
-        depto_seleccionado = st.selectbox("Departamento", ["VENTAS", "COMPRAS", "CONTABILIDAD", "GERENCIA", "SISTEMAS"])
-
+        depto_seleccionado = st.selectbox(
+            "Departamento", 
+            ["VENTAS", "COMPRAS", "CONTABILIDAD", "GERENCIA", "SISTEMAS"]
+        )
+    
+    # ✅ NUEVO: Checkbox para decidir si el usuario debe cambiar la contraseña al entrar
+    cambio_forzado_nuevo = st.checkbox(
+        "🔐 Obligar al usuario a cambiar la contraseña en su primer ingreso", 
+        value=True,
+        help="Si está marcado, el usuario deberá cambiar su contraseña antes de acceder al sistema."
+    )
+    
     sap_branch, sap_owner = None, None
 
     if depto_seleccionado == "VENTAS":
@@ -58,10 +74,9 @@ with tab_crear:
         
         if rol_seleccionado == "admin_punto" and almacen_sel != "Seleccione un almacén...":
             sap_branch = almacen_sel
-            st.info(f"💡 Se asignará el almacén: **{sap_branch}**")
+            st.info(f" Se asignará el almacén: **{sap_branch}**")
             
         elif rol_seleccionado == "comercial" and almacen_sel != "Seleccione un almacén...":
-            # ✅ MEJORA EXPERTA: Carga dinámica de colaboradores SOLO del almacén seleccionado
             with st.spinner("Cargando colaboradores activos en este almacén..."):
                 query_colab = """
                     SELECT DISTINCT "Colaborador", "Empleado_Ventas" AS "Codigo"
@@ -101,8 +116,9 @@ with tab_crear:
             try:
                 with conn.session as session:
                     session.execute(text("""
-                        INSERT INTO app.usuarios_portal (usuario, clave, nombre_completo, rol, departamento, sap_owner_code, sap_branch_code, activo)
-                        VALUES (:usr, :cla, :nom, :rol, :dep, :owner, :branch, TRUE);
+                        INSERT INTO app.usuarios_portal 
+                        (usuario, clave, nombre_completo, rol, departamento, sap_owner_code, sap_branch_code, activo, cambio_forzado)
+                        VALUES (:usr, :cla, :nom, :rol, :dep, :owner, :branch, TRUE, :cambio);
                     """), {
                         "usr": nuevo_usuario, 
                         "cla": generate_password_hash(default_pwd), 
@@ -110,7 +126,8 @@ with tab_crear:
                         "rol": rol_seleccionado, 
                         "dep": depto_seleccionado, 
                         "owner": sap_owner, 
-                        "branch": sap_branch
+                        "branch": sap_branch,
+                        "cambio": cambio_forzado_nuevo  # ✅ NUEVO
                     })
                     session.commit()
                 st.success(f"✅ ¡Usuario '{nuevo_usuario}' creado exitosamente!")
@@ -123,7 +140,12 @@ with tab_crear:
 # --------------------------------------------------
 with tab_masiva:
     st.subheader("📥 Cargar Usuarios desde Archivo Excel")
-    st.info(f"💡 **Instrucciones:** El archivo Excel debe tener las columnas: `usuario`, `nombre_completo`, `rol`, `departamento`, `sap_branch_code`, `sap_owner_code`. Contraseña asignada: **{default_pwd}**")
+    st.info(
+        f"💡 **Instrucciones:** El archivo Excel debe tener las columnas: "
+        f"`usuario`, `nombre_completo`, `rol`, `departamento`, `sap_branch_code`, `sap_owner_code`. "
+        f"Contraseña asignada: **{default_pwd}**. "
+        f"**Todos los usuarios cargados deberán cambiar su contraseña al primer ingreso.**"
+    )
     
     plantilla = pd.DataFrame(columns=["usuario", "nombre_completo", "rol", "departamento", "sap_branch_code", "sap_owner_code"])
     buffer = io.BytesIO()
@@ -160,8 +182,9 @@ with tab_masiva:
                                 owner = int(row.get('sap_owner_code')) if pd.notna(row.get('sap_owner_code')) and str(row.get('sap_owner_code')).replace('.', '', 1).isdigit() else None
                                 
                                 session.execute(text("""
-                                    INSERT INTO app.usuarios_portal (usuario, clave, nombre_completo, rol, departamento, sap_owner_code, sap_branch_code, activo)
-                                    VALUES (:usr, :cla, :nom, :rol, :dep, :owner, :branch, TRUE)
+                                    INSERT INTO app.usuarios_portal 
+                                    (usuario, clave, nombre_completo, rol, departamento, sap_owner_code, sap_branch_code, activo, cambio_forzado)
+                                    VALUES (:usr, :cla, :nom, :rol, :dep, :owner, :branch, TRUE, TRUE)
                                     ON CONFLICT (usuario) DO NOTHING;
                                 """), {
                                     "usr": usuario,
@@ -187,11 +210,24 @@ with tab_masiva:
 # --------------------------------------------------
 with tab_editar:
     st.subheader("Usuarios Registrados en el Sistema")
-    df_usuarios = conn.query("SELECT id, usuario, nombre_completo, rol, departamento, sap_branch_code, sap_owner_code, activo FROM app.usuarios_portal ORDER BY usuario ASC", ttl=0)
+    df_usuarios = conn.query(
+        "SELECT id, usuario, nombre_completo, rol, departamento, sap_branch_code, sap_owner_code, activo, cambio_forzado "
+        "FROM app.usuarios_portal ORDER BY usuario ASC", 
+        ttl=0
+    )
     
     df_display = df_usuarios.copy()
-    df_display['Estado'] = df_display['activo'].apply(lambda x: "🟢 Activo" if x else "🔴 Bloqueado")
-    st.dataframe(df_display[['usuario', 'nombre_completo', 'departamento', 'rol', 'sap_branch_code', 'Estado']], use_container_width=True, hide_index=True)
+    df_display['Estado'] = df_display['activo'].apply(lambda x: " Activo" if x else "🔴 Bloqueado")
+    # ✅ NUEVO: Mostrar estado de cambio_forzado de forma amigable
+    df_display['Cambio Clave'] = df_display['cambio_forzado'].apply(
+        lambda x: "⚠️ Pendiente" if x else "✅ Al día"
+    )
+    
+    st.dataframe(
+        df_display[['usuario', 'nombre_completo', 'departamento', 'rol', 'sap_branch_code', 'Estado', 'Cambio Clave']], 
+        use_container_width=True, 
+        hide_index=True
+    )
     
     st.markdown("---")
     st.subheader("✏️ Gestionar Usuario")
@@ -206,9 +242,17 @@ with tab_editar:
             with st.form("form_editar_usuario"):
                 e_nombre = st.text_input("Nombre Completo", value=datos_usr['nombre_completo'])
                 lista_roles = ["comercial", "admin_punto", "gerente_comercial", "gerente", "admin"]
-                e_rol = st.selectbox("Rol", lista_roles, index=lista_roles.index(datos_usr['rol']) if datos_usr['rol'] in lista_roles else 0)
+                e_rol = st.selectbox(
+                    "Rol", 
+                    lista_roles, 
+                    index=lista_roles.index(datos_usr['rol']) if datos_usr['rol'] in lista_roles else 0
+                )
                 lista_deptos = ["VENTAS", "COMPRAS", "CONTABILIDAD", "GERENCIA", "SISTEMAS"]
-                e_depto = st.selectbox("Departamento", lista_deptos, index=lista_deptos.index(datos_usr['departamento']) if datos_usr['departamento'] in lista_deptos else 0)
+                e_depto = st.selectbox(
+                    "Departamento", 
+                    lista_deptos, 
+                    index=lista_deptos.index(datos_usr['departamento']) if datos_usr['departamento'] in lista_deptos else 0
+                )
                 
                 val_b = str(datos_usr['sap_branch_code']) if pd.notna(datos_usr['sap_branch_code']) else ""
                 e_branch = st.text_input("Almacén / Sede (Opcional)", value=val_b).strip()
@@ -216,16 +260,30 @@ with tab_editar:
                 val_o = int(datos_usr['sap_owner_code']) if pd.notna(datos_usr['sap_owner_code']) else 0
                 e_owner = st.number_input("Código Comercial SAP (Opcional)", value=val_o)
                 
+                # ✅ NUEVO: Permitir al admin cambiar manualmente el estado de cambio_forzado
+                e_cambio_forzado = st.checkbox(
+                    "🔐 Obligar a cambiar contraseña en próximo ingreso", 
+                    value=bool(datos_usr.get('cambio_forzado', False))
+                )
+                
                 if st.form_submit_button("💾 Guardar Cambios"):
                     with conn.session as session:
                         session.execute(text("""
                             UPDATE app.usuarios_portal 
-                            SET nombre_completo = :nom, rol = :rol, departamento = :dep, sap_owner_code = :owner, sap_branch_code = :branch
+                            SET nombre_completo = :nom, 
+                                rol = :rol, 
+                                departamento = :dep, 
+                                sap_owner_code = :owner, 
+                                sap_branch_code = :branch,
+                                cambio_forzado = :cambio
                             WHERE usuario = :usr
                         """), {
-                            "nom": e_nombre, "rol": e_rol, "dep": e_depto, 
+                            "nom": e_nombre, 
+                            "rol": e_rol, 
+                            "dep": e_depto, 
                             "owner": e_owner if e_owner != 0 else None, 
                             "branch": e_branch if e_branch != "" else None,
+                            "cambio": e_cambio_forzado,  # ✅ NUEVO
                             "usr": usuario_a_gestionar
                         })
                         session.commit()
@@ -237,26 +295,35 @@ with tab_editar:
             estado_actual = "🟢 Activo" if datos_usr['activo'] else "🔴 Bloqueado"
             st.info(f"Estado actual: **{estado_actual}**")
             
+            # ✅ NUEVO: Mostrar estado de cambio_forzado
+            cambio_estado = "️ Pendiente de cambio" if datos_usr.get('cambio_forzado', False) else "✅ Contraseña al día"
+            st.info(f"Estado de contraseña: **{cambio_estado}**")
+            
             nuevo_estado = not datos_usr['activo']
             texto_boton = "🔓 Desbloquear Usuario" if not datos_usr['activo'] else "🚫 Bloquear Usuario"
             tipo_boton = "primary" if not datos_usr['activo'] else "secondary"
             
             if st.button(texto_boton, type=tipo_boton):
                 with conn.session as session:
-                    session.execute(text("UPDATE app.usuarios_portal SET activo = :activo WHERE usuario = :usr"), 
-                                    {"activo": nuevo_estado, "usr": usuario_a_gestionar})
+                    session.execute(
+                        text("UPDATE app.usuarios_portal SET activo = :activo WHERE usuario = :usr"), 
+                        {"activo": nuevo_estado, "usr": usuario_a_gestionar}
+                    )
                     session.commit()
                 st.success(f"✅ Usuario {'desbloqueado' if nuevo_estado else 'bloqueado'} exitosamente.")
                 st.rerun()
                 
             st.markdown("---")
-            st.warning("⚠️ **Eliminar es irreversible.**")
+            st.warning("️ **Eliminar es irreversible.**")
             confirm_delete = st.checkbox("Confirmo que deseo ELIMINAR permanentemente este usuario.")
             
             if st.button("🗑️ ELIMINAR USUARIO", type="primary", disabled=not confirm_delete):
                 try:
                     with conn.session as session:
-                        session.execute(text("DELETE FROM app.usuarios_portal WHERE usuario = :usr"), {"usr": usuario_a_gestionar})
+                        session.execute(
+                            text("DELETE FROM app.usuarios_portal WHERE usuario = :usr"), 
+                            {"usr": usuario_a_gestionar}
+                        )
                         session.commit()
                     st.success(f"✅ Usuario '{usuario_a_gestionar}' eliminado.")
                     st.rerun()
@@ -270,9 +337,31 @@ with tab_reset:
     st.subheader("🔐 Restablecer Credenciales Olvidadas")
     r_usr = st.selectbox("Seleccione la cuenta a restablecer:", df_usuarios['usuario'].tolist())
     
+    # ✅ NUEVO: Checkbox para decidir si se fuerza el cambio de contraseña
+    forzar_cambio = st.checkbox(
+        "🔐 Obligar al usuario a cambiar la contraseña en su próximo ingreso", 
+        value=True,
+        help="Si está marcado, el usuario deberá cambiar su contraseña antes de acceder al sistema."
+    )
+    
     if st.button("🚨 Resetear a Contraseña de Fábrica", type="primary"):
         with conn.session as session:
-            session.execute(text("UPDATE app.usuarios_portal SET clave = :nueva WHERE usuario = :usr"), 
-                            {"nueva": generate_password_hash(default_pwd), "usr": r_usr})
+            session.execute(
+                text("""
+                    UPDATE app.usuarios_portal 
+                    SET clave = :nueva, cambio_forzado = :cambio 
+                    WHERE usuario = :usr
+                """), 
+                {
+                    "nueva": generate_password_hash(default_pwd), 
+                    "usr": r_usr,
+                    "cambio": forzar_cambio  # ✅ NUEVO
+                }
+            )
             session.commit()
-        st.success(f"✅ La contraseña de **{r_usr}** ha vuelto a ser '{default_pwd}'.")
+        
+        mensaje = f"✅ La contraseña de **{r_usr}** ha vuelto a ser '{default_pwd}'."
+        if forzar_cambio:
+            mensaje += " El usuario deberá cambiarla en su próximo ingreso."
+        
+        st.success(mensaje)

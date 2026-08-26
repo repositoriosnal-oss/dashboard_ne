@@ -47,10 +47,31 @@ if not st.session_state["autenticado"]:
                 st.session_state["sap_owner_code"] = user_df.iloc[0]["sap_owner_code"]
                 st.session_state["sap_branch_code"] = user_df.iloc[0]["sap_branch_code"]
                 st.session_state["departamento"] = user_df.iloc[0]["departamento"]
+                
+                # ✅ NUEVO: Capturar el estado de cambio_forzado
+                # Si la columna no existe (por compatibilidad), asumimos FALSE
+                st.session_state["cambio_forzado"] = bool(user_df.iloc[0].get("cambio_forzado", False))
+                
                 st.rerun()
             else:
                 st.error("❌ Credenciales inválidas o usuario bloqueado. Intenta de nuevo.")
     st.stop()
+
+# ============================================================
+# 🔐 BLOQUEO DE ACCESO: Si el usuario debe cambiar la clave,
+# solo puede acceder a la página de cambio de clave
+# ============================================================
+if st.session_state.get("cambio_forzado", False):
+    # Solo mostramos la página de cambio obligatorio
+    pag_cambiar_clave = st.Page(
+        "views/cambiar_clave.py", 
+        title="Cambio Obligatorio de Contraseña", 
+        icon=":material/lock:", 
+        default=True
+    )
+    navegacion = st.navigation([pag_cambiar_clave])
+    navegacion.run()
+    st.stop()  # Detiene la ejecución aquí, no muestra nada más
 
 # ============================================================
 # 2. DECLARACIÓN DE PÁGINAS (sin espacios en rutas)
@@ -99,12 +120,17 @@ navegacion.run()
 # ============================================================
 with st.sidebar:
     st.markdown("---")
-    st.write(f"👤 **{st.session_state['nombre_completo']}**")
+    st.write(f"👤 {st.session_state['nombre_completo']}")
     st.caption(f"Depto: {st.session_state['departamento']} | Rol: {st.session_state['rol_actual'].upper()}")
+    
+    # ✅ Indicador visual si el usuario tiene cambio_forzado activo
+    if st.session_state.get("cambio_forzado", False):
+        st.warning("⚠️ Debes cambiar tu contraseña")
+    
     st.markdown("---")
 
     if st.session_state["rol_actual"] in ["admin", "gerente"]:
-        st.markdown("### 🛠️ Sincronización")
+        st.markdown("### ️ Sincronización")
         if st.button(
             "Forzar Sincronización SAP",
             icon=":material/sync:",
@@ -118,6 +144,6 @@ with st.sidebar:
                     st.rerun()
         st.markdown("---")
 
-    if st.button("🚪 Cerrar Sesión", icon=":material/logout:", use_container_width=True):
+    if st.button(" Cerrar Sesión", icon=":material/logout:", use_container_width=True):
         st.session_state.clear()
         st.rerun()
