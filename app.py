@@ -47,34 +47,28 @@ if not st.session_state["autenticado"]:
                 st.session_state["sap_owner_code"] = user_df.iloc[0]["sap_owner_code"]
                 st.session_state["sap_branch_code"] = user_df.iloc[0]["sap_branch_code"]
                 st.session_state["departamento"] = user_df.iloc[0]["departamento"]
-                
-                # ✅ NUEVO: Capturar el estado de cambio_forzado
-                # Si la columna no existe (por compatibilidad), asumimos FALSE
                 st.session_state["cambio_forzado"] = bool(user_df.iloc[0].get("cambio_forzado", False))
-                
                 st.rerun()
             else:
                 st.error("❌ Credenciales inválidas o usuario bloqueado. Intenta de nuevo.")
     st.stop()
 
 # ============================================================
-# 🔐 BLOQUEO DE ACCESO: Si el usuario debe cambiar la clave,
-# solo puede acceder a la página de cambio de clave
+# 🔐 BLOQUEO DE ACCESO: cambio de clave obligatorio
 # ============================================================
 if st.session_state.get("cambio_forzado", False):
-    # Solo mostramos la página de cambio obligatorio
     pag_cambiar_clave = st.Page(
-        "views/cambiar_clave.py", 
-        title="Cambio Obligatorio de Contraseña", 
-        icon=":material/lock:", 
+        "views/cambiar_clave.py",
+        title="Cambio Obligatorio de Contraseña",
+        icon=":material/lock:",
         default=True
     )
     navegacion = st.navigation([pag_cambiar_clave])
     navegacion.run()
-    st.stop()  # Detiene la ejecución aquí, no muestra nada más
+    st.stop()
 
 # ============================================================
-# 2. DECLARACIÓN DE PÁGINAS (sin espacios en rutas)
+# 2. DECLARACIÓN DE PÁGINAS
 # ============================================================
 pag_inicio = st.Page("views/inicio.py", title="Inicio", icon=":material/home:", default=True)
 pag_ventas_meta = st.Page("views/ventas.py", title="Ventas vs Metas", icon=":material/trending_up:")
@@ -86,16 +80,24 @@ pag_traslados = st.Page("views/solicitudes_traslados.py", title="Solicitudes de 
 pag_facturas = st.Page("views/facturas_reserva.py", title="Facturas de Reserva", icon=":material/receipt_long:")
 pag_notas = st.Page("views/notas_credito.py", title="Notas Crédito Abiertas", icon=":material/credit_score:")
 pag_usuarios = st.Page("views/admin_usuarios.py", title="Gestión de Usuarios", icon=":material/group:")
+pag_rotacion = st.Page("views/rotacion_articulos.py", title="Rotación Artículos", icon=":material/inventory_2:")
+
+# 🎁 Módulo Bonificaciones
+pag_bono_detalle = st.Page("views/bonificaciones_detalle.py", title="Detalle Bono", icon=":material/redeem:")
+pag_bono_conciliacion = st.Page("views/bonificaciones_conciliacion.py", title="Conciliación Bono", icon=":material/fact_check:")
+pag_bono_variables = st.Page("views/bono_variables.py", title="Variables del Bono", icon=":material/tune:")
+pag_contabilidad = st.Page("views/contabilidad_exentas.py", title="Auditoría Exentas", icon=":material/account_balance:")
 
 # ============================================================
 # 3. MENÚ DINÁMICO POR DEPARTAMENTO Y ROL
 # ============================================================
-estructura_menu = [pag_inicio]
 depto_usuario = st.session_state["departamento"]
 
+estructura_menu = {"": [pag_inicio]}
+
 if depto_usuario in ["VENTAS", "SISTEMAS", "GERENCIA"]:
-    estructura_menu += [
-        pag_ventas_meta,
+    estructura_menu["Ventas"] = [pag_ventas_meta]
+    estructura_menu["Partidas Abiertas"] = [
         pag_remisiones,
         pag_cotizaciones,
         pag_ordenes,
@@ -105,8 +107,29 @@ if depto_usuario in ["VENTAS", "SISTEMAS", "GERENCIA"]:
         pag_compras,
     ]
 
+# 🔐 Sección "Compras" gateada por ROL
+ROLES_CON_ACCESO_COMPRAS = ["compras", "gerente", "admin"]
+if st.session_state["rol_actual"] in ROLES_CON_ACCESO_COMPRAS:
+    estructura_menu["Compras"] = [pag_rotacion]
+
+# 🎁 Sección Bonificaciones:
+# - Detalle y Conciliación: admin, gerente, gerente_comercial
+# - Variables del Bono: SOLO admin y gerente (gerente_comercial no la ve)
+ROLES_BONIFICACIONES = ["admin", "gerente", "gerente_comercial"]
+ROLES_EDIT_BONO = ["admin", "gerente"]
+if st.session_state["rol_actual"] in ROLES_BONIFICACIONES:
+    paginas_bono = [pag_bono_detalle, pag_bono_conciliacion]
+    if st.session_state["rol_actual"] in ROLES_EDIT_BONO:
+        paginas_bono.append(pag_bono_variables)
+    estructura_menu["Bonificaciones"] = paginas_bono
+
+# 🏦 Sección Contabilidad: SOLO admin, gerente y contabilidad
+ROLES_CONTABILIDAD = ["admin", "gerente", "contabilidad"]
+if st.session_state["rol_actual"] in ROLES_CONTABILIDAD:
+    estructura_menu["Contabilidad"] = [pag_contabilidad]
+
 if st.session_state["rol_actual"] == "admin":
-    estructura_menu.append(pag_usuarios)
+    estructura_menu["Administración"] = [pag_usuarios]
 
 navegacion = st.navigation(estructura_menu)
 
@@ -122,15 +145,14 @@ with st.sidebar:
     st.markdown("---")
     st.write(f"👤 {st.session_state['nombre_completo']}")
     st.caption(f"Depto: {st.session_state['departamento']} | Rol: {st.session_state['rol_actual'].upper()}")
-    
-    # ✅ Indicador visual si el usuario tiene cambio_forzado activo
+
     if st.session_state.get("cambio_forzado", False):
         st.warning("⚠️ Debes cambiar tu contraseña")
-    
+
     st.markdown("---")
 
     if st.session_state["rol_actual"] in ["admin", "gerente"]:
-        st.markdown("### ️ Sincronización")
+        st.markdown("### 🛠️ Sincronización")
         if st.button(
             "Forzar Sincronización SAP",
             icon=":material/sync:",
@@ -144,6 +166,6 @@ with st.sidebar:
                     st.rerun()
         st.markdown("---")
 
-    if st.button(" Cerrar Sesión", icon=":material/logout:", use_container_width=True):
+    if st.button("🚪 Cerrar Sesión", icon=":material/logout:", use_container_width=True):
         st.session_state.clear()
         st.rerun()

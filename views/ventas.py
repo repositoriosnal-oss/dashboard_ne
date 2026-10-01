@@ -155,37 +155,61 @@ with st.sidebar:
     vendedores_disp = sorted(df_seguro["nombre_vendedor"].dropna().unique().tolist())
     vendedores_sel = st.multiselect("Vendedor:", vendedores_disp, default=vendedores_disp, key="sb_vend_ventas")
 
-    st.markdown("---")
-    st.markdown("##### Filtros Dinámicos Activos")
-    filtros_sidebar = []
-    if st.session_state.clicked_almacen_ventas:
-        filtros_sidebar.append(f"P. Venta: {st.session_state.clicked_almacen_ventas}")
-    if st.session_state.clicked_vendedor_ventas:
-        filtros_sidebar.append(f"Vendedor: {st.session_state.clicked_vendedor_ventas}")
-    if st.session_state.clicked_mes_ventas:
-        filtros_sidebar.append(f"Mes: {st.session_state.clicked_mes_ventas}")
-        
-    if filtros_sidebar:
-        for f in filtros_sidebar:
-            st.markdown(f"• {f}")
-        st.markdown("---")
+#    ====================================================================================       
+#    Filtro de boton para quitar filtros graficos
+#    ====================================================================================  st.markdown("---")
+    
+    # ✅ Solo mostrar el botón si hay algún filtro dinámico activo
+    if st.session_state.clicked_almacen_ventas or st.session_state.clicked_vendedor_ventas or st.session_state.clicked_mes_ventas:
         if st.button("Limpiar Filtros de Gráfico", use_container_width=True):
             st.session_state.clicked_almacen_ventas = None
             st.session_state.clicked_vendedor_ventas = None
             st.session_state.clicked_mes_ventas = None
             st.rerun()
-        st.caption("Haz clic nuevamente en la barra seleccionada para quitar el filtro.")
-    else:
-        st.markdown("*Ninguno activo*")
-        st.caption("Haz clic en cualquier barra de los gráficos para filtrar en cascada.")
 
-    st.markdown("---")
-    num_meses_sidebar = len(meses_sel) if meses_sel else 1
-    st.markdown("### Metas Configuradas")
-    st.caption(f"Meta mensual por P. Venta: ${META_PUNTO_VENTA_MENSUAL:,.0f}")
-    st.caption(f"Meta mensual por Ejecutivo: ${META_EJECUTIVO_MENSUAL:,.0f}")
-    if num_meses_sidebar > 1:
-        st.info(f"Meta Ajustada: Al seleccionar {num_meses_sidebar} meses en el filtro, la meta se multiplica automáticamente x{num_meses_sidebar}.")
+
+
+
+
+
+#    ====================================================================================       
+#    Filtro de boton para quitar filtros graficos y texto de filtros aplicados
+#    ====================================================================================  st.markdown("---")
+
+#    st.markdown("---")
+#    st.markdown("##### Filtros Dinámicos Activos")
+#    filtros_sidebar = []
+#    if st.session_state.clicked_almacen_ventas:
+#        filtros_sidebar.append(f"P. Venta: {st.session_state.clicked_almacen_ventas}")
+#    if st.session_state.clicked_vendedor_ventas:
+#        filtros_sidebar.append(f"Vendedor: {st.session_state.clicked_vendedor_ventas}")
+#    if st.session_state.clicked_mes_ventas:
+#        filtros_sidebar.append(f"Mes: {st.session_state.clicked_mes_ventas}")
+#        
+#    if filtros_sidebar:
+#        for f in filtros_sidebar:
+#            st.markdown(f"• {f}")
+#        st.markdown("---")
+#        if st.button("Limpiar Filtros de Gráfico", use_container_width=True):
+#            st.session_state.clicked_almacen_ventas = None
+#            st.session_state.clicked_vendedor_ventas = None 
+#            st.session_state.clicked_mes_ventas = None
+#            st.rerun()
+#        st.caption("Haz clic nuevamente en la barra seleccionada para quitar el filtro.")
+#    else:
+#        st.markdown("*Ninguno activo*")
+#        st.caption("Haz clic en cualquier barra de los gráficos para filtrar en cascada.")
+
+#    ============================================================
+#    Se aplica para que en el sidebar salga el mensaje descrito
+#    ============================================================
+#    st.markdown("---")
+#    num_meses_sidebar = len(meses_sel) if meses_sel else 1
+#    st.markdown("### Metas Configuradas")
+#    st.caption(f"Meta mensual por P. Venta: ${META_PUNTO_VENTA_MENSUAL:,.0f}")
+#    st.caption(f"Meta mensual por Ejecutivo: ${META_EJECUTIVO_MENSUAL:,.0f}")
+#    if num_meses_sidebar > 1:
+#        st.info(f"Meta Ajustada: Al seleccionar {num_meses_sidebar} meses en el filtro, la meta se multiplica automáticamente x{num_meses_sidebar}.")
 
 # ============================================================
 # APLICAR FILTROS BASE (Sidebar)

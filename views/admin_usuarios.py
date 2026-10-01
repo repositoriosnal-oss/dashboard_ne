@@ -51,7 +51,7 @@ with tab_crear:
         nombre_visible = st.text_input("Nombre Completo")
         rol_seleccionado = st.selectbox(
             "Rol de Seguridad", 
-            ["comercial", "admin_punto", "gerente_comercial", "gerente", "admin"]
+            ["comercial", "admin_punto", "gerente_comercial", "gerente", "compras", "contabilidad", "admin"]
         )
         
     with col2:
@@ -241,7 +241,7 @@ with tab_editar:
             st.markdown("#### Modificar Datos")
             with st.form("form_editar_usuario"):
                 e_nombre = st.text_input("Nombre Completo", value=datos_usr['nombre_completo'])
-                lista_roles = ["comercial", "admin_punto", "gerente_comercial", "gerente", "admin"]
+                lista_roles = ["comercial", "admin_punto", "gerente_comercial", "gerente", "compras", "contabilidad", "admin"]
                 e_rol = st.selectbox(
                     "Rol", 
                     lista_roles, 
