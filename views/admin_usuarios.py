@@ -51,13 +51,13 @@ with tab_crear:
         nombre_visible = st.text_input("Nombre Completo")
         rol_seleccionado = st.selectbox(
             "Rol de Seguridad", 
-            ["comercial", "admin_punto", "gerente_comercial", "gerente", "compras", "contabilidad", "admin"]
+            ["comercial", "admin_punto", "gerente_comercial", "gerente", "compras", "contabilidad", "talento_humano", "admin"]
         )
         
     with col2:
         depto_seleccionado = st.selectbox(
             "Departamento", 
-            ["VENTAS", "COMPRAS", "CONTABILIDAD", "GERENCIA", "SISTEMAS"]
+            ["VENTAS", "COMPRAS", "CONTABILIDAD", "TALENTO_HUMANO", "GERENCIA", "SISTEMAS"]
         )
     
     # ✅ NUEVO: Checkbox para decidir si el usuario debe cambiar la contraseña al entrar
@@ -241,13 +241,13 @@ with tab_editar:
             st.markdown("#### Modificar Datos")
             with st.form("form_editar_usuario"):
                 e_nombre = st.text_input("Nombre Completo", value=datos_usr['nombre_completo'])
-                lista_roles = ["comercial", "admin_punto", "gerente_comercial", "gerente", "compras", "contabilidad", "admin"]
+                lista_roles = ["comercial", "admin_punto", "gerente_comercial", "gerente", "compras", "contabilidad", "talento_humano", "admin"]
                 e_rol = st.selectbox(
                     "Rol", 
                     lista_roles, 
                     index=lista_roles.index(datos_usr['rol']) if datos_usr['rol'] in lista_roles else 0
                 )
-                lista_deptos = ["VENTAS", "COMPRAS", "CONTABILIDAD", "GERENCIA", "SISTEMAS"]
+                lista_deptos = ["VENTAS", "COMPRAS", "CONTABILIDAD", "TALENTO_HUMANO", "GERENCIA", "SISTEMAS"]
                 e_depto = st.selectbox(
                     "Departamento", 
                     lista_deptos, 

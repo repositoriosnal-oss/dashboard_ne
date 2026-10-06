@@ -87,6 +87,8 @@ pag_bono_detalle = st.Page("views/bonificaciones_detalle.py", title="Detalle Bon
 pag_bono_conciliacion = st.Page("views/bonificaciones_conciliacion.py", title="Conciliación Bono", icon=":material/fact_check:")
 pag_bono_variables = st.Page("views/bono_variables.py", title="Variables del Bono", icon=":material/tune:")
 pag_contabilidad = st.Page("views/contabilidad_exentas.py", title="Auditoría Exentas", icon=":material/account_balance:")
+pag_rrhh_novedades = st.Page("views/rrhh_novedades.py", title="Novedades RRHH", icon=":material/badge:")
+pag_rrhh_cols = st.Page("views/rrhh_colaboradores.py", title="Colaboradores y Distribución", icon=":material/groups:")
 
 # ============================================================
 # 3. MENÚ DINÁMICO POR DEPARTAMENTO Y ROL
@@ -127,6 +129,10 @@ if st.session_state["rol_actual"] in ROLES_BONIFICACIONES:
 ROLES_CONTABILIDAD = ["admin", "gerente", "contabilidad"]
 if st.session_state["rol_actual"] in ROLES_CONTABILIDAD:
     estructura_menu["Contabilidad"] = [pag_contabilidad]
+
+from src.rrhh import ROLES_RRHH_CARGUE
+if st.session_state["rol_actual"] in ROLES_RRHH_CARGUE:
+    estructura_menu["Talento Humano"] = [pag_rrhh_cols, pag_rrhh_novedades]
 
 if st.session_state["rol_actual"] == "admin":
     estructura_menu["Administración"] = [pag_usuarios]
