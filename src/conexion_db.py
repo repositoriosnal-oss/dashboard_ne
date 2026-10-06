@@ -208,7 +208,8 @@ def ejecutar_sincronizacion_desde_sap():
                     WHEN T3."SeriesName" IN ('CT3E', 'CT3F', 'NCCENT3.', 'NPCENT3', 'RC-CENT3', 'CT3J') THEN 'Q3' 
                     WHEN T3."SeriesName" IN ('CT5E', 'CT5F', 'NCCENT5.', 'NPCENT5', 'RC-CENT5', 'NDFCENT5', 'CT5J') THEN 'Q5' 
                     WHEN T3."SeriesName" IN ('CT6E', 'CT6F', 'CT6J', 'NCCENT6.', 'NPCENT6', 'RC-CENT6', 'NDFCENT6') THEN 'Q6' 
-                    WHEN T3."SeriesName" IN ('VILE', 'VILF', 'VILJ', 'NCVILLA.', 'NPVILLA', 'RC-VILLA', 'ND-VILLA') THEN 'VILL' 
+                    WHEN T3."SeriesName" IN ('VILE', 'VILF', 'VILJ', 'NCVILLA.', 'NPVILLA', 'RC-VILLA', 'ND-VILLA') THEN 'VILL'
+                    WHEN T3."SeriesName" IN ('GIRE', 'GIRJ', 'GIRF', 'NPGIRAR', 'NCGIRAR') THEN 'GIRAR' 
                     ELSE COALESCE(T5."WhsName", 'Sin Almacen') 
                 END AS "nombre_almacen",
                 T0."OwnerCode" AS "propietario_doc",
@@ -266,6 +267,7 @@ def ejecutar_sincronizacion_desde_sap():
                     WHEN T3."SeriesName" IN ('CT5E', 'CT5F', 'NCCENT5.', 'NPCENT5', 'RC-CENT5', 'NDFCENT5', 'CT5J') THEN 'Q5' 
                     WHEN T3."SeriesName" IN ('CT6E', 'CT6F', 'CT6J', 'NCCENT6.', 'NPCENT6', 'RC-CENT6', 'NDFCENT6') THEN 'Q6' 
                     WHEN T3."SeriesName" IN ('VILE', 'VILF', 'VILJ', 'NCVILLA.', 'NPVILLA', 'RC-VILLA', 'ND-VILLA') THEN 'VILL' 
+                    WHEN T3."SeriesName" IN ('GIRE', 'GIRJ', 'GIRF', 'NPGIRAR', 'NCGIRAR') THEN 'GIRAR' 
                     ELSE COALESCE(T5."WhsName", 'Sin Almacen') 
                 END AS "nombre_almacen",
                 T0."OwnerCode" AS "propietario_doc",
@@ -740,7 +742,8 @@ def aplicar_seguridad_rls_ventas(df: pd.DataFrame) -> pd.DataFrame:
         mapa_inverso = {
             "EJECUTIVOS COMERCIALES": "EJECOM", "PUNTO 134": "ALM134", "7 DE AGOSTO": "7AGOS", 
             "AVENIDA19": "AV19", "CENTRO 1": "Q1", "CENTRO 3": "Q3", "CENTRO 5": "Q5", "CENTRO 6": "Q6",
-            "PUNTO170": "ALM170", "NORTE128": "ALM128", "VILLAVICENCIO": "VILL", "ARMENIA": "ARME", "CHIA": "CHIA"
+            "PUNTO170": "ALM170", "NORTE128": "ALM128", "VILLAVICENCIO": "VILL", "ARMENIA": "ARME", "CHIA": "CHIA",
+            "GIRARDOT": "GIRAR",
         }
         codigo_corto = mapa_inverso.get(branch_str, branch_str)
         
@@ -1061,6 +1064,7 @@ MAPEO_SERIES_BONO = {
     **{k: "CENTRO 6" for k in ['CT6E', 'CT6F', 'CT6J', 'NCCENT6.', 'NPCENT6', 'RC-CENT6', 'NDFCENT6']},
     **{k: "VILLAVICENCIO" for k in ['VILE', 'VILF', 'VILJ', 'NCVILLA.', 'NPVILLA', 'RC-VILLA', 'ND-VILLA']},
     **{k: "BODEGA INGENIERIA" for k in ['INGE', 'INGF', 'NCINGEN.', 'ND-INGEN', 'NPINGEN', 'FactClie', 'RC-INGEN', 'NDFINGEN']},
+    **{k: "GIRARDOT" for k in ['GIRE', 'GIRJ', 'GIRF', 'NPGIRAR', 'NCGIRAR']},
 }
 
 # ============================================================
@@ -1082,7 +1086,9 @@ MAP_SERIE_FACTURA = {
     **{k: "CENTRO 5" for k in ['CT5E', 'CT5F', 'NCCENT5.', 'NPCENT5', 'RC-CENT5', 'NDFCENT5', 'CT5J']},
     **{k: "CENTRO 6" for k in ['CT6E', 'CT6F', 'CT6J', 'NCCENT6.', 'NPCENT6', 'RC-CENT6', 'NDFCENT6']},
     **{k: "VILLAVICENCIO" for k in ['VILE', 'VILF', 'VILJ', 'NCVILLA.', 'NPVILLA', 'RC-VILLA', 'ND-VILLA']},
+    **{k: "GIRARDOT" for k in ['GIRE', 'GIRJ', 'GIRF', 'NPGIRAR', 'NCGIRAR']},
 }
+
 MAP_SERIE_PAGO = {
     **{k: "NORTE128" for k in ['128E', 'NCNT128.', 'ND-NT128', 'RC-NT128']},
     **{k: "PUNTO 134" for k in ['134E', '134F', 'NCAU134', 'NDFAU134', 'NPAU134', 'RC-AU134', '134J']},
@@ -1097,6 +1103,7 @@ MAP_SERIE_PAGO = {
     **{k: "CENTRO 5" for k in ['CT5E', 'CT5F', 'NPCENT5', 'RC-CENT5', 'NDFCENT5']},
     **{k: "CENTRO 6" for k in ['CT6E', 'CT6J', 'NCCENT6.', 'NPCENT6', 'RC-CENT6', 'NDFCENT6']},
     **{k: "VILLAVICENCIO" for k in ['VILE', 'VILF', 'VILJ', 'NCVILLA.', 'NPVILLA', 'RC-VILLA', 'ND-VILLA']},
+    **{k: "GIRARDOT" for k in ['GIRE', 'GIRJ', 'GIRF', 'NPGIRAR', 'NCGIRAR']},
 }
 SHORT2FULL = {
     "ALM128": "NORTE128", "ALM134": "PUNTO 134", "ALM170": "PUNTO170",
@@ -1104,6 +1111,7 @@ SHORT2FULL = {
     "CHIA": "CHIA", "EJECOM": "EJECUTIVOS COMERCIALES",
     "Q1": "CENTRO 1", "Q3": "CENTRO 3", "Q5": "CENTRO 5", "Q6": "CENTRO 6",
     "VILL": "VILLAVICENCIO",
+    "GIRAR": "GIRARDOT",
 }
 META_BONO_PLENO = 2_580_000_000
 META_BONO_PARCIAL = 2_190_000_000
@@ -1184,6 +1192,7 @@ MAP_SERIE_ANTICIPOS = {
     **{k: "CENTRO 6" for k in ['CT6E', 'CT6J', 'NCCENT6.', 'NPCENT6', 'RC-CENT6']},
     **{k: "BODEGA INGENIERIA" for k in ['INGE', 'INGF', 'NCINGEN.', 'ND-INGEN', 'NPINGEN', 'FactClie', 'RC-INGEN']},
     **{k: "VILLAVICENCIO" for k in ['VILE', 'VILF', 'VILJ', 'NCVILLA.', 'NPVILLA', 'RC-VILLA']},
+    **{k: "GIRARDOT" for k in ['GIRE', 'GIRJ', 'GIRF', 'NPGIRAR', 'NCGIRAR']},
 }
 
 # ============================================================
