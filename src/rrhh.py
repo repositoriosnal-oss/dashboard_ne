@@ -166,7 +166,7 @@ def validar_solape_asignacion(colaborador_id, fecha_desde, fecha_hasta=None):
         WHERE colaborador_id = :c
         AND fecha_desde < :fh
         AND COALESCE(fecha_hasta, DATE '2100-12-31') > :fd
-    """, {"c": int(colaborador_id), "fd": fecha_desde, "fh": fh}, ttl=0)
+    """, params={"c": int(colaborador_id), "fd": fecha_desde, "fh": fh}, ttl=0)
     conflictos = []
     for _, r in df.iterrows():
         conflictos.append(f"Se solapa con {r['almacen']} / {r['cargo']} "
@@ -190,8 +190,10 @@ def seed_almacenes_desde_maps():
 # Bootstrap al importar (igual que bono_variables). Si falla, avisa sin romper la app.
 try:
     bootstrap_rrhh()
+    seed_almacenes_desde_maps()    #  prueba
 except Exception as e:
     try:
         st.warning(f"⚠️ Bootstrap RRHH no ejecutado: {e}")
     except Exception:
         pass
+

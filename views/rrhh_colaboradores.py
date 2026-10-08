@@ -1,413 +1,624 @@
 import io
-import streamlit as st
+from datetime import date, timedelta
 import pandas as pd
+import streamlit as st
+from openpyxl.worksheet.datavalidation import DataValidation
 from sqlalchemy import text
 from src.conexion_db import conn
-from src.rrhh import (ROLES_RRHH_CARGUE, auditar_rrhh, validar_suma_100,
-                      validar_solape_asignacion)
+from src.rrhh import ROLES_RRHH_CARGUE, auditar_rrhh, validar_suma_100
 
 st.set_page_config(page_title="Colaboradores RRHH", layout="wide")
-st.title("👥 Talento Humano — Colaboradores y Distribución del Bono")
+st.title("Talento Humano — Colaboradores y Distribución del Bono")
 st.markdown("---")
 
 rol = st.session_state.get("rol_actual")
 if rol not in ROLES_RRHH_CARGUE:
-    st.error("⛔ Acceso denegado. Solo Talento Humano, Gerencia y Administración.")
+    st.error("Acceso denegado. Solo Talento Humano, Gerencia y Administración.")
     st.stop()
 
-tab_cols, tab_dist, tab_asig = st.tabs(
-    ["🧑‍💼 Colaboradores", "📊 Plantilla de Distribución por Almacén",
-     "🔗 Asignaciones Persona ↔ Puesto"])
+# ============================================================
+# CATÁLOGOS ESTÁNDAR
+# ============================================================
+ALMACENES = [
+    ("ALM128", "NORTE128"), ("ALM134", "PUNTO 134"), ("ALM170", "PUNTO170"),
+    ("7AGOS", "7 DE AGOSTO"), ("AV19", "AVENIDA 19"), ("ARME", "ARMENIA"),
+    ("CHIA", "CHIA"), ("EJECOM", "EJECUTIVOS COMERCIALES"),
+    ("Q1", "CENTRO 1"), ("Q3", "CENTRO 3"), ("Q5", "CENTRO 5"), ("Q6", "CENTRO 6"),
+    ("VILL", "VILLAVICENCIO"), ("GIRAR", "GIRARDOT"),
+]
+ALM_COD = dict(ALMACENES)
+ALM_NORM = {**{c: c for c, _ in ALMACENES}, **{n: c for c, n in ALMACENES}}
+CARGOS = [
+    "Gerente Punto", "Ejecutivo Comercial",
+    "Vendedor 1", "Vendedor 2", "Vendedor 3",
+    "Cajera", "Bodega 1", "Bodega 2", "Conductor",
+]
 
 # ============================================================
-# PESTAÑA 1: COLABORADORES
+# MIGRACIÓN IDEMPOTENTE
 # ============================================================
-with tab_cols:
-    st.subheader("Alta manual de un colaborador")
-    with st.form("form_alta_colab"):
+with conn.session as con:
+    for ddl in [
+        "ALTER TABLE rrhh.colaboradores ADD COLUMN IF NOT EXISTS almacen_actual TEXT",
+        "ALTER TABLE rrhh.colaboradores ADD COLUMN IF NOT EXISTS cargo_actual TEXT",
+        "ALTER TABLE rrhh.colaboradores ADD COLUMN IF NOT EXISTS en_prueba BOOLEAN NOT NULL DEFAULT FALSE",
+        "ALTER TABLE rrhh.colaboradores ADD COLUMN IF NOT EXISTS prueba_inicio DATE",
+        "ALTER TABLE rrhh.colaboradores ADD COLUMN IF NOT EXISTS prueba_fin DATE",
+        "ALTER TABLE rrhh.colaboradores ADD COLUMN IF NOT EXISTS fecha_inactividad DATE",
+    ]:
+        con.execute(text(ddl))
+    con.commit()
+
+# ============================================================
+# HELPERS DE NEGOCIO
+# ============================================================
+def _pdate(v):
+    if v is None or (isinstance(v, float) and pd.isna(v)) or str(v).strip() == "":
+        return None
+    d = pd.to_datetime(v, errors="coerce")
+    return None if pd.isna(d) else d.date()
+
+def _cedula_ok(c):
+    import re
+    return bool(c) and re.fullmatch(r"\d{5,12}", c) is not None
+
+def _solape(con, cid, desde, hasta, excluir_id=None):
+    fh = hasta or date(2100, 12, 31)
+    return con.execute(text("""
+        SELECT id, almacen, cargo, fecha_desde, COALESCE(fecha_hasta, DATE '2100-12-31') AS fh
+        FROM rrhh.asignaciones
+        WHERE colaborador_id = :c AND id <> COALESCE(:ex, -1)
+          AND fecha_desde < :fh AND COALESCE(fecha_hasta, DATE '2100-12-31') > :fd
+    """), {"c": cid, "fd": desde, "fh": fh, "ex": excluir_id}).fetchall()
+
+def _vigente(con, cid):
+    return con.execute(text("""
+        SELECT id, almacen, cargo, fecha_desde FROM rrhh.asignaciones
+        WHERE colaborador_id = :c AND fecha_hasta IS NULL
+    """), {"c": cid}).fetchone()
+
+def _nueva_asignacion(con, cid, almacen, cargo, desde, hasta=None):
+    conf = _solape(con, cid, desde, hasta)
+    if conf:
+        r = conf[0]
+        raise ValueError(f"Solape con {r[1]}/{r[2]} ({r[3]} -> {r[4]}).")
+    res = con.execute(text("""
+        INSERT INTO rrhh.asignaciones (colaborador_id, almacen, cargo, fecha_desde, fecha_hasta)
+        VALUES (:c, :a, :g, :fd, :fh) RETURNING id
+    """), {"c": cid, "a": almacen, "g": cargo, "fd": desde, "fh": hasta})
+    return res.fetchone()[0]
+
+def _aplicar_traslado(con, cid, destino, fin_origen, inicio_destino):
+    if inicio_destino <= fin_origen:
+        raise ValueError("La fecha de inicio en destino debe ser posterior a la fecha fin en origen.")
+    v = _vigente(con, cid)
+    if v is None:
+        raise ValueError("El colaborador no tiene asignación vigente para trasladar.")
+    conf = _solape(con, cid, inicio_destino, None, excluir_id=v[0])
+    if conf:
+        raise ValueError(f"Solape con otra asignación: {conf[0][1]}/{conf[0][2]}.")
+    con.execute(text("UPDATE rrhh.asignaciones SET fecha_hasta = :fh WHERE id = :id"),
+                {"fh": fin_origen, "id": v[0]})
+    _nueva_asignacion(con, cid, destino, v[2], inicio_destino)
+    con.execute(text("UPDATE rrhh.colaboradores SET almacen_actual = :a WHERE id = :c"),
+                {"a": destino, "c": cid})
+
+def _aplicar_cambio_cargo(con, cid, nuevo_cargo, fecha):
+    v = _vigente(con, cid)
+    if v is None:
+        raise ValueError("El colaborador no tiene asignación vigente.")
+    if v[2] == nuevo_cargo:
+        raise ValueError("El cargo nuevo es igual al actual.")
+    conf = _solape(con, cid, fecha, None, excluir_id=v[0])
+    if conf:
+        raise ValueError(f"Solape con otra asignación: {conf[0][1]}/{conf[0][2]}.")
+    con.execute(text("UPDATE rrhh.asignaciones SET fecha_hasta = :fh WHERE id = :id"),
+                {"fh": fecha - timedelta(days=1), "id": v[0]})
+    _nueva_asignacion(con, cid, v[1], nuevo_cargo, fecha)
+    con.execute(text("UPDATE rrhh.colaboradores SET cargo_actual = :g WHERE id = :c"),
+                {"g": nuevo_cargo, "c": cid})
+
+def _upsert_colaborador(con, d):
+    res = con.execute(text("""
+        INSERT INTO rrhh.colaboradores
+            (cedula, nombre, slp_code, owner_code, usuario_portal, fecha_ingreso,
+             periodo_prueba_meses, activo, almacen_actual, cargo_actual,
+             en_prueba, prueba_inicio, prueba_fin, fecha_inactividad)
+        VALUES (:ced,:nom,:slp,:own,:por,:ing,2,:act,:alm,:car,:pr,:pi,:pf,:fi)
+        ON CONFLICT (cedula) DO UPDATE SET
+            nombre = EXCLUDED.nombre, slp_code = EXCLUDED.slp_code,
+            owner_code = EXCLUDED.owner_code, usuario_portal = EXCLUDED.usuario_portal,
+            fecha_ingreso = EXCLUDED.fecha_ingreso, activo = EXCLUDED.activo,
+            almacen_actual = EXCLUDED.almacen_actual, cargo_actual = EXCLUDED.cargo_actual,
+            en_prueba = EXCLUDED.en_prueba, prueba_inicio = EXCLUDED.prueba_inicio,
+            prueba_fin = EXCLUDED.prueba_fin, fecha_inactividad = EXCLUDED.fecha_inactividad
+        RETURNING id
+    """), d)
+    return res.fetchone()[0]
+
+# ============================================================
+# PLANTILLA EXCEL (solo columnas de creación)
+# ============================================================
+def construir_plantilla():
+    cols = ["cedula", "nombre", "almacen", "cargo", "fecha_ingreso",
+            "en_periodo_prueba", "prueba_inicio", "prueba_fin"]
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl") as xw:
+        pd.DataFrame(columns=cols).to_excel(xw, index=False, sheet_name="colaboradores")
+        ws = xw.sheets["colaboradores"]
+        dv_alm = DataValidation(type="list", formula1='"' + ", ".join(c for c, _ in ALMACENES) + '"', allow_blank=True)
+        dv_cargo = DataValidation(type="list", formula1='"' + ", ".join(CARGOS) + '"', allow_blank=True)
+        dv_sn = DataValidation(type="list", formula1='"SI,NO"', allow_blank=True)
+        ws.add_data_validation(dv_alm); dv_alm.add("C2:C1000")
+        ws.add_data_validation(dv_cargo); dv_cargo.add("D2:D1000")
+        ws.add_data_validation(dv_sn); dv_sn.add("F2:F1000")
+        for col in ["E", "G", "H"]:
+            for r in range(2, 1001):
+                ws[f"{col}{r}"].number_format = "YYYY-MM-DD"
+        pd.DataFrame({
+            "campo": cols,
+            "instruccion": [
+                "Obligatorio, solo números (5-12 dígitos)", "Obligatorio",
+                "Desplegable: código de almacén", "Desplegable: cargo",
+                "Fecha AAAA-MM-DD", "SI / NO",
+                "Solo si prueba = SI. Inicio (sugerido = fecha de ingreso)",
+                "Solo si prueba = SI. Fin (sugerido = inicio + 2 meses)"],
+        }).to_excel(xw, index=False, sheet_name="ayuda")
+        pd.DataFrame({"almacen_codigo": [c for c, _ in ALMACENES],
+                      "almacen_nombre": [n for _, n in ALMACENES]}).to_excel(
+            xw, index=False, sheet_name="catalogo_almacenes")
+        pd.DataFrame({"cargo": CARGOS}).to_excel(xw, index=False, sheet_name="catalogo_cargos")
+    return buf.getvalue()
+
+# ============================================================
+# PESTAÑAS
+# ============================================================
+tab_res, tab_new, tab_edit, tab_dist, tab_hist = st.tabs(
+    ["Resumen", "Crear y carga masiva", "Editar / Movimientos",
+     "Distribución por Almacén", "Historial"])
+
+# ------------------------------------------------------------
+# RESUMEN
+# ------------------------------------------------------------
+with tab_res:
+    df = conn.query("""
+        SELECT c.id, c.cedula, c.nombre,
+               COALESCE(c.almacen_actual, a.almacen) AS almacen,
+               COALESCE(c.cargo_actual, a.cargo) AS cargo,
+               c.fecha_ingreso, c.en_prueba, c.prueba_inicio, c.prueba_fin,
+               c.activo, c.fecha_inactividad
+        FROM rrhh.colaboradores c
+        LEFT JOIN LATERAL (SELECT almacen, cargo FROM rrhh.asignaciones
+                           WHERE colaborador_id = c.id AND fecha_hasta IS NULL
+                           ORDER BY fecha_desde DESC LIMIT 1) a ON TRUE
+        ORDER BY c.nombre
+    """, ttl=0)
+    if df.empty:
+        st.info("Aún no hay colaboradores. Créalos en la pestaña 'Crear y carga masiva'.")
+    else:
+        act = df[df["activo"]]
+        c1, c2, c3, c4, c5 = st.columns(5)
+        c1.metric("Colaboradores", len(df)); c2.metric("Activos", len(act))
+        c3.metric("Inactivos", len(df) - len(act))
+        c4.metric("En prueba", int(act["en_prueba"].sum()))
+        c5.metric("Sin puesto", int((act["almacen"].isna() | act["cargo"].isna()).sum()))
+        f1, f2, f3 = st.columns(3)
+        fa = f1.multiselect("Almacén", sorted(df["almacen"].dropna().unique()))
+        fc = f2.multiselect("Cargo", sorted(df["cargo"].dropna().unique()))
+        fe = f3.multiselect("Estado", ["ACTIVO", "INACTIVO"], default=["ACTIVO", "INACTIVO"])
+        v = df.copy()
+        v["estado"] = v["activo"].map({True: "ACTIVO", False: "INACTIVO"})
+        if fa: v = v[v["almacen"].isin(fa)]
+        if fc: v = v[v["cargo"].isin(fc)]
+        if fe: v = v[v["estado"].isin(fe)]
+        st.dataframe(v, use_container_width=True, hide_index=True)
+        st.download_button("Descargar vista (CSV)", v.to_csv(index=False).encode("utf-8-sig"),
+                           file_name="colaboradores_th.csv", mime="text/csv")
+
+# ------------------------------------------------------------
+# CREAR Y CARGA MASIVA
+# ------------------------------------------------------------
+with tab_new:
+    modo = st.radio("Cómo cargar", ["Formulario individual", "Carga masiva (Excel)"], horizontal=True)
+    if modo.startswith("Formulario"):
+        # --- Datos fuera del form para renderizado dinámico del periodo de prueba ---
         c1, c2, c3 = st.columns(3)
-        with c1:
-            ced = st.text_input("Cédula *", key="ced_nueva")
-            nom = st.text_input("Nombre completo *", key="nom_nuevo")
-        with c2:
-            ing = st.date_input("Fecha de ingreso *", key="ing_nuevo")
-            prb = st.number_input("Periodo de prueba (meses)", min_value=0, max_value=12,
-                                  value=2, key="prb_nuevo")
-        with c3:
-            slp = st.number_input("SlpCode SAP (opcional)", value=0, step=1, key="slp_nuevo")
-            own = st.number_input("OwnerCode SAP (opcional)", value=0, step=1, key="own_nuevo")
-            portal = st.text_input("Usuario del portal (opcional)", key="portal_nuevo")
+        ced = c1.text_input("Cédula *", key="new_ced")
+        nom = c2.text_input("Nombre completo *", key="new_nom")
+        f_ing = c3.date_input("Fecha de ingreso *", value=None, key="new_fing")
+        c1, c2, c3 = st.columns(3)
+        alm = c1.selectbox("Almacén *", ALMACENES, format_func=lambda x: f"{x[0]} - {x[1]}",
+                           index=None, key="new_alm")
+        car = c2.selectbox("Cargo *", CARGOS, index=None, key="new_car")
+        prb = c3.radio("Periodo de prueba", ["NO", "SI"], horizontal=True, key="new_prb")
 
-        submitted = st.form_submit_button("➕ Guardar colaborador")
-        if submitted:
-            if not ced.strip() or not nom.strip():
-                st.error("Cédula y nombre son obligatorios.")
-            else:
-                with conn.session as con:
-                    res = con.execute(text("""
-                        INSERT INTO rrhh.colaboradores
-                            (cedula, nombre, slp_code, owner_code, usuario_portal,
-                             fecha_ingreso, periodo_prueba_meses)
-                        VALUES (:ced, :nom, NULLIF(:slp,0), NULLIF(:own,0), NULLIF(:por,''),
-                                :ing, :prb)
-                        ON CONFLICT (cedula) DO UPDATE SET
-                            nombre = EXCLUDED.nombre,
-                            slp_code = COALESCE(EXCLUDED.slp_code, rrhh.colaboradores.slp_code),
-                            owner_code = COALESCE(EXCLUDED.owner_code, rrhh.colaboradores.owner_code),
-                            usuario_portal = COALESCE(EXCLUDED.usuario_portal, rrhh.colaboradores.usuario_portal),
-                            fecha_ingreso = EXCLUDED.fecha_ingreso,
-                            periodo_prueba_meses = EXCLUDED.periodo_prueba_meses
-                        RETURNING id
-                    """), {"ced": ced.strip(), "nom": nom.strip(), "slp": int(slp),
-                           "own": int(own), "por": portal.strip(), "ing": ing, "prb": int(prb)})
-                    cid = res.fetchone()[0]
-                    con.commit()
-                auditar_rrhh("colaboradores", cid, "UPSERT", None,
-                             {"cedula": ced.strip(), "nombre": nom.strip()})
-                st.success(f"✅ Colaborador guardado (id {cid}).")
-                st.rerun()
+        # Periodo de prueba: se renderiza dinámicamente al elegir SI
+        p_ini = p_fin = None
+        if prb == "SI":
+            c1, c2 = st.columns(2)
+            p_ini = c1.date_input("Inicio periodo de prueba",
+                                  value=f_ing, key="new_pi")
+            p_fin = c2.date_input("Fin periodo de prueba",
+                                  value=(f_ing + timedelta(days=60)) if f_ing else None,
+                                  key="new_pf")
 
-    st.markdown("---")
-    st.subheader("Carga masiva por Excel")
-    st.caption("Plantilla: columnas exactas → `cedula` (texto), `nombre`, `fecha_ingreso` "
-               "(AAAA-MM-DD), `periodo_prueba_meses` (opcional, default 2), "
-               "`slp_code` (opcional), `owner_code` (opcional), `usuario_portal` (opcional).")
-    plantilla = pd.DataFrame({
-        "cedula": ["1234567890"], "nombre": ["Ejemplo Pérez"],
-        "fecha_ingreso": ["2026-01-15"], "periodo_prueba_meses": [2],
-        "slp_code": [""], "owner_code": [""], "usuario_portal": [""],
-    })
-    buf_p = io.BytesIO()
-    with pd.ExcelWriter(buf_p, engine="openpyxl") as xw:
-        plantilla.to_excel(xw, index=False, sheet_name="colaboradores")
-    st.download_button("📥 Descargar plantilla Excel (.xlsx)", buf_p.getvalue(),
-                       file_name="plantilla_colaboradores.xlsx", mime="sheet")
+        with st.form("form_alta_submit"):
+            if st.form_submit_button("Crear colaborador", type="primary"):
+                errs = []
+                if not _cedula_ok(ced.strip()): errs.append("Cédula inválida (solo números, 5-12 dígitos).")
+                if not nom.strip(): errs.append("El nombre es obligatorio.")
+                if f_ing is None: errs.append("La fecha de ingreso es obligatoria.")
+                if alm is None: errs.append("Seleccione almacén.")
+                if car is None: errs.append("Seleccione cargo.")
+                if prb == "SI":
+                    if p_ini is None or p_fin is None:
+                        errs.append("Periodo de prueba: indique inicio y fin.")
+                    else:
+                        if f_ing and p_ini < f_ing:
+                            errs.append("El inicio de la prueba no puede ser anterior al ingreso.")
+                        if p_fin <= p_ini:
+                            errs.append("El fin de la prueba debe ser posterior al inicio.")
+                if errs:
+                    st.error("Corrige:\n" + "\n".join(errs))
+                else:
+                    try:
+                        with conn.session as con:
+                            cid = _upsert_colaborador(con, {
+                                "ced": ced.strip(), "nom": nom.strip(),
+                                "slp": None, "own": None, "por": None, "ing": f_ing,
+                                "act": True, "alm": alm[0], "car": car,
+                                "pr": prb == "SI", "pi": p_ini, "pf": p_fin, "fi": None})
+                            if not con.execute(text(
+                                "SELECT 1 FROM rrhh.asignaciones WHERE colaborador_id=:c LIMIT 1"),
+                                    {"c": cid}).fetchone():
+                                _nueva_asignacion(con, cid, alm[0], car, f_ing)
+                            con.commit()
+                        auditar_rrhh("colaboradores", cid, "CREAR", None,
+                                     {"cedula": ced.strip(), "nombre": nom.strip()})
+                        st.success(f"Colaborador {nom} creado (activo).")
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"{e}")
+    else:
+        st.download_button("Descargar plantilla (.xlsx)", construir_plantilla(),
+                           file_name="plantilla_colaboradores_th.xlsx",
+                           mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+        upl = st.file_uploader("Subir Excel diligenciado", type=["xlsx"])
+        if upl:
+            dfx = pd.read_excel(upl, sheet_name="colaboradores")
+            dfx.columns = [str(c).strip().lower() for c in dfx.columns]
+            errs, ok = [], 0
+            with conn.session as con:
+                try:
+                    for i, r in dfx.iterrows():
+                        ced = str(r.get("cedula", "")).strip()
+                        nom = str(r.get("nombre", "")).strip()
+                        if not ced or not nom or str(ced).lower() == "nan":
+                            continue
+                        if not _cedula_ok(ced):
+                            errs.append(f"Fila {i+2}: cédula inválida."); continue
+                        alm_c = ALM_NORM.get(str(r.get("almacen", "")).strip())
+                        car_v = str(r.get("cargo", "")).strip()
+                        if not alm_c or car_v not in CARGOS:
+                            errs.append(f"Fila {i+2}: almacén/cargo inválido."); continue
+                        f_ing = _pdate(r.get("fecha_ingreso"))
+                        if f_ing is None:
+                            errs.append(f"Fila {i+2}: fecha_ingreso inválida."); continue
+                        pr = str(r.get("en_periodo_prueba", "NO")).strip().upper() == "SI"
+                        pi, pf = _pdate(r.get("prueba_inicio")), _pdate(r.get("prueba_fin"))
+                        if pr and (pi is None or pf is None or pf <= pi or pi < f_ing):
+                            errs.append(f"Fila {i+2}: fechas de prueba inválidas."); continue
+                        cid = _upsert_colaborador(con, {
+                            "ced": ced, "nom": nom, "slp": None, "own": None, "por": None,
+                            "ing": f_ing, "act": True, "alm": alm_c, "car": car_v,
+                            "pr": pr, "pi": pi, "pf": pf, "fi": None})
+                        if not con.execute(text(
+                            "SELECT 1 FROM rrhh.asignaciones WHERE colaborador_id=:c LIMIT 1"),
+                                {"c": cid}).fetchone():
+                            _nueva_asignacion(con, cid, alm_c, car_v, f_ing)
+                        ok += 1
+                    if errs:
+                        con.rollback()
+                        st.error("No se importó nada. Corrige:\n" + "\n".join(errs))
+                    else:
+                        con.commit()
+                        auditar_rrhh("colaboradores", "bulk", "IMPORT", None, {"filas": ok})
+                        st.success(f"{ok} filas importadas.")
+                        st.rerun()
+                except Exception as e:
+                    con.rollback()
+                    st.error(f"{e}")
 
-    upl = st.file_uploader("Subir archivo .xlsx o .csv", type=["xlsx", "csv"])
-    if upl is not None:
-        try:
-            df = (pd.read_csv(upl) if upl.name.lower().endswith(".csv")
-                  else pd.read_excel(upl, sheet_name="colaboradores"))
-        except Exception as e:
-            st.error(f"No se pudo leer el archivo: {e}")
-            df = None
+# ------------------------------------------------------------
+# EDITAR / MOVIMIENTOS
+# ------------------------------------------------------------
+with tab_edit:
+    lista = conn.query("SELECT id, cedula, nombre, activo FROM rrhh.colaboradores ORDER BY nombre", ttl=0)
+    if lista.empty:
+        st.info("Sin colaboradores.")
+    else:
+        ops = {f"{r.nombre} - CC {r.cedula}" + ("" if r.activo else " (inactivo)"): r.id
+               for r in lista.itertuples()}
+        sel = st.selectbox("Colaborador", list(ops), index=None)
+        if sel:
+            cid = ops[sel]
+            with conn.session as con:
+                est = con.execute(text("""
+                    SELECT c.*, a.id AS asig_id, a.almacen, a.cargo, a.fecha_desde
+                    FROM rrhh.colaboradores c
+                    LEFT JOIN LATERAL (SELECT id, almacen, cargo, fecha_desde FROM rrhh.asignaciones
+                                       WHERE colaborador_id=:c AND fecha_hasta IS NULL
+                                       ORDER BY fecha_desde DESC LIMIT 1) a ON TRUE
+                    WHERE c.id=:c
+                """), {"c": cid}).mappings().fetchone()
+            m1, m2, m3, m4 = st.columns(4)
+            m1.metric("Almacén", est["almacen"] or "—")
+            m2.metric("Cargo", est["cargo"] or "—")
+            m3.metric("Estado", "ACTIVO" if est["activo"] else "INACTIVO")
+            m4.metric("Prueba", "SÍ" if est["en_prueba"] else "NO")
 
-        if df is not None:
-            faltan = {"cedula", "nombre", "fecha_ingreso"} - set(df.columns)
-            if faltan:
-                st.error(f"Faltan columnas obligatorias: {faltan}")
-            else:
-                df["cedula"] = df["cedula"].astype(str).str.strip()
-                df = df[df["cedula"] != ""].drop_duplicates(subset="cedula", keep="last")
-                st.dataframe(df, use_container_width=True, hide_index=True)
-                st.info(f"{len(df)} filas listas para importar (se actualizan las cédulas existentes).")
-
-                if st.button("💾 Confirmar importación"):
-                    ok, err = 0, []
-                    for _, r in df.iterrows():
-                        try:
+            # --- DATOS BÁSICOS ---
+            with st.expander("Datos básicos (corrige errores de carga)"):
+                with st.form("form_basic"):
+                    n_nom = st.text_input("Nombre completo", value=est["nombre"])
+                    n_ced = st.text_input("Cédula", value=est["cedula"])
+                    if st.form_submit_button("Guardar datos básicos"):
+                        errs = []
+                        if not _cedula_ok(n_ced.strip()): errs.append("Cédula inválida.")
+                        if n_ced.strip() != est["cedula"]:
+                            dup = conn.query("SELECT id FROM rrhh.colaboradores WHERE cedula=:c AND id<>:id",
+                                             params={"c": n_ced.strip(), "id": cid}, ttl=0)
+                            if not dup.empty: errs.append("La cédula ya pertenece a otro colaborador.")
+                        if errs:
+                            st.error("\n".join(errs))
+                        else:
+                            antes = {"nombre": est["nombre"], "cedula": est["cedula"]}
                             with conn.session as con:
                                 con.execute(text("""
-                                    INSERT INTO rrhh.colaboradores
-                                        (cedula, nombre, slp_code, owner_code, usuario_portal,
-                                         fecha_ingreso, periodo_prueba_meses)
-                                    VALUES (:ced, :nom, NULLIF(:slp,0), NULLIF(:own,0), NULLIF(:por,''),
-                                            :ing, :prb)
-                                    ON CONFLICT (cedula) DO UPDATE SET
-                                        nombre = EXCLUDED.nombre,
-                                        slp_code = COALESCE(EXCLUDED.slp_code, rrhh.colaboradores.slp_code),
-                                        owner_code = COALESCE(EXCLUDED.owner_code, rrhh.colaboradores.owner_code),
-                                        usuario_portal = COALESCE(EXCLUDED.usuario_portal, rrhh.colaboradores.usuario_portal),
-                                        fecha_ingreso = EXCLUDED.fecha_ingreso,
-                                        periodo_prueba_meses = EXCLUDED.periodo_prueba_meses
-                                """), {
-                                    "ced": str(r["cedula"]).strip(),
-                                    "nom": str(r["nombre"]).strip(),
-                                    "slp": int(float(r["slp_code"])) if pd.notna(r.get("slp_code")) and str(r.get("slp_code")).strip() not in ("", "nan") else 0,
-                                    "own": int(float(r["owner_code"])) if pd.notna(r.get("owner_code")) and str(r.get("owner_code")).strip() not in ("", "nan") else 0,
-                                    "por": str(r.get("usuario_portal") or "").strip(),
-                                    "ing": pd.to_datetime(r["fecha_ingreso"]).date(),
-                                    "prb": int(float(r.get("periodo_prueba_meses") or 2)),
-                                })
+                                    UPDATE rrhh.colaboradores SET nombre=:nom, cedula=:ced
+                                    WHERE id=:c
+                                """), {"nom": n_nom.strip(), "ced": n_ced.strip(), "c": cid})
                                 con.commit()
-                            ok += 1
-                        except Exception as e:
-                            err.append(f"fila {r['cedula']}: {e}")
-                    auditar_rrhh("colaboradores", "bulk", "IMPORT", None,
-                                 {"filas_ok": ok, "errores": err[:20]})
-                    st.success(f"✅ {ok} colaboradores importados.")
-                    if err:
-                        st.warning("Con errores:\n" + "\n".join(err))
-                    st.rerun()
+                            auditar_rrhh("colaboradores", cid, "UPDATE_DATOS", antes,
+                                         {"nombre": n_nom.strip(), "cedula": n_ced.strip()})
+                            st.success("Datos básicos guardados.")
+                            st.rerun()
 
-    st.markdown("---")
-    st.subheader("Listado de colaboradores")
-    df_c = conn.query("""
-        SELECT id, cedula, nombre, slp_code, owner_code, usuario_portal,
-               fecha_ingreso, periodo_prueba_meses, activo
-        FROM rrhh.colaboradores ORDER BY nombre
-    """, ttl=0)
-    
-    if not df_c.empty:
-        st.dataframe(df_c, use_container_width=True, hide_index=True)
-        with st.expander("Desactivar / reactivar colaborador"):
-            sel_id = st.selectbox("ID del colaborador", df_c["id"].tolist())
-            if st.button("🔄 Alternar estado activo"):
-                fila = df_c[df_c["id"] == sel_id].iloc[0]
-                with conn.session as con:
-                    con.execute(text("""
-                        UPDATE rrhh.colaboradores SET activo = NOT activo WHERE id = :i
-                    """), {"i": int(sel_id)})
-                    con.commit()
-                auditar_rrhh("colaboradores", sel_id, "TOGGLE_ACTIVO",
-                             {"activo": bool(fila["activo"])}, {"activo": not bool(fila["activo"])})
-                st.rerun()
-    else:
-        st.info("Aún no hay colaboradores registrados.")
-
-# ============================================================
-# PESTAÑA 2: PLANTILLA DE DISTRIBUCIÓN POR ALMACÉN
-# ============================================================
-with tab_dist:
-    st.subheader("Distribución del bono por cargo (%)")
-    st.caption("Regla de oro: por almacén y vigencia, la suma de porcentajes debe dar "
-               "EXACTAMENTE 100%. Los cargos y porcentajes varían entre almacenes.")
-
-    alm = conn.query("SELECT codigo, nombre_serie FROM app.almacenes WHERE activo=TRUE ORDER BY codigo", ttl=0)
-    if alm.empty:
-        st.warning("La tabla app.almacenes está vacía. Ejecuta seed_almacenes_desde_maps().")
-    else:
-        map_alm = dict(zip(alm["codigo"], alm["nombre_serie"].fillna(alm["codigo"])))
-        sel_alm = st.selectbox("Almacén", list(map_alm.keys()),
-                               format_func=lambda k: f"{k} — {map_alm[k]}")
-
-        df_d = conn.query("""
-            SELECT id, almacen, cargo, pct, vigente_desde, vigente_hasta
-            FROM rrhh.distribucion_puestos WHERE almacen = :a ORDER BY vigente_desde DESC, cargo
-        """, {"a": sel_alm}, ttl=0)
-        
-        if not df_d.empty:
-            total_vig = df_d.groupby("vigente_desde")["pct"].sum()
-            for vig, tot in total_vig.items():
-                marca = "✅" if abs(float(tot) - 100.0) < 0.001 else "❌"
-                st.markdown(f"{marca} Vigencia **{vig}**: suma = `{float(tot):.3f}%`")
-            st.dataframe(df_d, use_container_width=True, hide_index=True)
-
-        st.markdown("##### Alta manual de un puesto")
-        with st.form("form_puesto"):
-            p1, p2, p3, p4 = st.columns(4)
-            with p1:
-                cargo = st.text_input("Cargo *", key="cargo_nuevo")
-            with p2:
-                pct = st.number_input("% del bono *", min_value=0.0, max_value=100.0,
-                                      step=0.5, value=0.0, key="pct_nuevo")
-            with p3:
-                v_desde = st.date_input("Vigente desde *", key="vd_nuevo")
-            with p4:
-                v_hasta = st.date_input("Vigente hasta (vacío = abierto)",
-                                        value=None, key="vh_nuevo")
-            guardar = st.form_submit_button("💾 Guardar puesto")
-
-        if guardar:
-            if not cargo.strip() or pct <= 0:
-                st.error("Cargo y porcentaje (>0) son obligatorios.")
-            else:
-                # Validación anticipada: ¿cuánto sumaría esta vigencia?
-                suma_actual = float(df_d[df_d["vigente_desde"] == v_desde]["pct"].sum()) if not df_d.empty else 0.0
-                nueva_suma = suma_actual + float(pct)
-                with conn.session as con:
-                    res = con.execute(text("""
-                        INSERT INTO rrhh.distribucion_puestos
-                            (almacen, cargo, pct, vigente_desde, vigente_hasta)
-                        VALUES (:a, :c, :p, :vd, :vh)
-                        ON CONFLICT (almacen, cargo, vigente_desde) DO UPDATE SET
-                            pct = EXCLUDED.pct, vigente_hasta = EXCLUDED.vigente_hasta
-                        RETURNING id
-                    """), {"a": sel_alm, "c": cargo.strip(), "p": float(pct),
-                           "vd": v_desde, "vh": v_hasta})
-                    pid = res.fetchone()[0]
-                    con.commit()
-                auditar_rrhh("distribucion_puestos", pid, "UPSERT", None,
-                             {"almacen": sel_alm, "cargo": cargo.strip(), "pct": float(pct)})
-                if abs(nueva_suma - 100.0) < 0.001:
-                    st.success(f"✅ Plantilla completa: {sel_alm} vigencia {v_desde} suma 100%.")
-                elif nueva_suma > 100.0:
-                    st.error(f"❌ La vigencia {v_desde} de {sel_alm} suma {nueva_suma:.3f}% (>100%). "
-                             "Ajusta los porcentajes antes de liquidar.")
-                else:
-                    st.warning(f"⏳ Vigencia {v_desde} de {sel_alm} suma {nueva_suma:.3f}% "
-                               f"(falta {100 - nueva_suma:.3f}% para completar la plantilla).")
-                st.rerun()
-
-        st.markdown("---")
-        st.subheader("Carga masiva de plantilla (Excel)")
-        st.caption("Columnas exactas: `almacen` (código, ej: Q6), `cargo`, `pct`, "
-                   "`vigente_desde` (AAAA-MM-DD), `vigente_hasta` (opcional).")
-        plant_d = pd.DataFrame({
-            "almacen": ["Q6"], "cargo": ["Gerente de punto"], "pct": [22.0],
-            "vigente_desde": ["2026-10-01"], "vigente_hasta": [""],
-        })
-        buf_d = io.BytesIO()
-        with pd.ExcelWriter(buf_d, engine="openpyxl") as xw:
-            plant_d.to_excel(xw, index=False, sheet_name="distribucion")
-        st.download_button("📥 Descargar plantilla distribución (.xlsx)", buf_d.getvalue(),
-                           file_name="plantilla_distribucion.xlsx", mime="sheet")
-
-        upl_d = st.file_uploader("Subir plantilla de distribución", type=["xlsx", "csv"], key="upl_dist")
-        if upl_d is not None:
-            try:
-                dfx = (pd.read_csv(upl_d) if upl_d.name.lower().endswith(".csv")
-                       else pd.read_excel(upl_d, sheet_name="distribucion"))
-            except Exception as e:
-                st.error(f"No se pudo leer: {e}")
-                dfx = None
-
-            if dfx is not None:
-                req = {"almacen", "cargo", "pct", "vigente_desde"}
-                if req - set(dfx.columns):
-                    st.error(f"Faltan columnas: {req - set(dfx.columns)}")
-                else:
-                    dfx["vigente_desde"] = pd.to_datetime(dfx["vigente_desde"]).dt.date
-                    if "vigente_hasta" in dfx.columns:
-                        dfx["vigente_hasta"] = pd.to_datetime(dfx["vigente_hasta"], errors="coerce").dt.date
-                    else:
-                        dfx["vigente_hasta"] = pd.NaT
-
-                    codigos_invalidos = set(dfx["almacen"]) - set(map_alm.keys())
-                    if codigos_invalidos:
-                        st.error(f"Códigos de almacén desconocidos: {codigos_invalidos}")
-                    else:
-                        errs = validar_suma_100(dfx)
-                        st.dataframe(dfx, use_container_width=True, hide_index=True)
-                        if errs:
-                            st.error("**Validación 100% fallida:**\n" + "\n".join(errs))
-                            st.caption("Corrige el Excel y vuelve a subirlo. No se importará nada.")
-                        else:
-                            st.success("✅ Todos los almacenes/vigencias suman exactamente 100%.")
-                            if st.button("💾 Importar plantilla completa"):
-                                n = 0
-                                for _, r in dfx.iterrows():
+            # --- ASIGNACIÓN VIGENTE (corregir o crear inicial) ---
+            with st.expander("Asignación de puesto (almacén/cargo)"):
+                if est["asig_id"] is None:
+                    st.warning("Este colaborador no tiene asignación vigente. Puedes crearla ahora (caso típico: se creó sin almacén por error).")
+                    with st.form("form_creacion_asig"):
+                        a1, a2, a3 = st.columns(3)
+                        ca = a1.selectbox("Almacén", ALMACENES,
+                                          format_func=lambda x: f"{x[0]} - {x[1]}", index=None)
+                        cc = a2.selectbox("Cargo", CARGOS, index=None)
+                        cd = a3.date_input("Fecha desde", value=est["fecha_ingreso"])
+                        if st.form_submit_button("Crear asignación inicial"):
+                            if ca is None or cc is None or cd is None:
+                                st.error("Completa los tres campos.")
+                            else:
+                                try:
                                     with conn.session as con:
+                                        _nueva_asignacion(con, cid, ca[0], cc, cd)
                                         con.execute(text("""
-                                            INSERT INTO rrhh.distribucion_puestos
-                                                (almacen, cargo, pct, vigente_desde, vigente_hasta)
-                                            VALUES (:a, :c, :p, :vd, :vh)
-                                            ON CONFLICT (almacen, cargo, vigente_desde) DO UPDATE SET
-                                                pct = EXCLUDED.pct, vigente_hasta = EXCLUDED.vigente_hasta
-                                        """), {
-                                            "a": str(r["almacen"]).strip(), "c": str(r["cargo"]).strip(),
-                                            "p": float(r["pct"]), "vd": r["vigente_desde"],
-                                            "vh": (r["vigente_hasta"] if pd.notna(r["vigente_hasta"]) else None),
-                                        })
+                                            UPDATE rrhh.colaboradores SET almacen_actual=:a, cargo_actual=:g
+                                            WHERE id=:c
+                                        """), {"a": ca[0], "g": cc, "c": cid})
                                         con.commit()
-                                    n += 1
-                                auditar_rrhh("distribucion_puestos", "bulk", "IMPORT",
-                                             None, {"filas": n})
-                                st.success(f"✅ {n} puestos importados.")
+                                    auditar_rrhh("asignaciones", cid, "CREAR_ASIGNACION_INICIAL", None,
+                                                 {"almacen": ca[0], "cargo": cc, "desde": str(cd)})
+                                    st.success("Asignación inicial creada.")
+                                    st.rerun()
+                                except Exception as e:
+                                    st.error(f"{e}")
+                else:
+                    st.caption("Corrección: reescribe almacén/cargo de la asignación vigente sin crear historial de movimientos. El cambio queda auditado.")
+                    with st.form("form_corr_asig"):
+                        a1, a2 = st.columns(2)
+                        ca = a1.selectbox("Almacén", ALMACENES, format_func=lambda x: f"{x[0]} - {x[1]}",
+                                          index=[c for c, _ in ALMACENES].index(est["almacen"]) if est["almacen"] in ALM_COD else None)
+                        cc = a2.selectbox("Cargo", CARGOS,
+                                          index=CARGOS.index(est["cargo"]) if est["cargo"] in CARGOS else None)
+                        if st.form_submit_button("Guardar corrección"):
+                            if ca is None or cc is None:
+                                st.error("Selecciona almacén y cargo.")
+                            else:
+                                antes = {"almacen": est["almacen"], "cargo": est["cargo"]}
+                                with conn.session as con:
+                                    con.execute(text("UPDATE rrhh.asignaciones SET almacen=:a, cargo=:g WHERE id=:i"),
+                                                {"a": ca[0], "g": cc, "i": est["asig_id"]})
+                                    con.execute(text("UPDATE rrhh.colaboradores SET almacen_actual=:a, cargo_actual=:g WHERE id=:c"),
+                                                {"a": ca[0], "g": cc, "c": cid})
+                                    con.commit()
+                                auditar_rrhh("asignaciones", est["asig_id"], "CORRECCION_ASIGNACION",
+                                             antes, {"almacen": ca[0], "cargo": cc})
+                                st.success("Asignación vigente corregida.")
                                 st.rerun()
 
-# ============================================================
-# PESTAÑA 3: ASIGNACIONES PERSONA ↔ PUESTO (con historial)
-# ============================================================
-with tab_asig:
-    st.subheader("Asignar colaboradores a un puesto de un almacén")
-    st.caption("Un colaborador no puede tener dos asignaciones que se solapen en el tiempo. "
-               "El periodo de prueba se calcula automáticamente desde fecha de ingreso + meses.")
+            # --- TRASLADO ---
+            with st.expander("Traslado de punto de venta (movimiento real)"):
+                with st.form("form_traslado"):
+                    t1, t2, t3c = st.columns(3)
+                    t1.markdown(f"Origen actual: **{est['almacen'] or '—'}**")
+                    td = t2.selectbox("Almacén destino", ALMACENES,
+                                      format_func=lambda x: f"{x[0]} - {x[1]}", index=None)
+                    tf = t3c.date_input("Fecha fin en origen", value=None)
+                    ti = st.date_input("Fecha inicio en destino", value=None)
+                    if st.form_submit_button("Registrar traslado"):
+                        if td is None or tf is None or ti is None:
+                            st.error("Completa destino y ambas fechas.")
+                        else:
+                            try:
+                                with conn.session as con:
+                                    _aplicar_traslado(con, cid, td[0], tf, ti)
+                                    con.commit()
+                                auditar_rrhh("asignaciones", cid, "TRASLADO",
+                                             {"origen": est["almacen"]},
+                                             {"destino": td[0], "fin_origen": str(tf), "inicio_destino": str(ti)})
+                                st.success("Traslado registrado.")
+                                st.rerun()
+                            except Exception as e:
+                                st.error(f"{e}")
 
-    cols_a = conn.query("""
-        SELECT id, cedula, nombre, fecha_ingreso, periodo_prueba_meses
-        FROM rrhh.colaboradores WHERE activo=TRUE ORDER BY nombre
-    """, ttl=0)
-    alm_a = conn.query("SELECT codigo, nombre_serie FROM app.almacenes WHERE activo=TRUE ORDER BY codigo", ttl=0)
-    
-    if cols_a.empty or alm_a.empty:
-        st.info("Necesitas al menos un colaborador y almacenes sembrados para asignar puestos.")
+            # --- CAMBIO DE CARGO ---
+            with st.expander("Cambio de cargo (movimiento real)"):
+                with st.form("form_cargo"):
+                    h1, h2 = st.columns(2)
+                    h1.markdown(f"Cargo actual: **{est['cargo'] or '—'}**")
+                    cn = h2.selectbox("Cargo nuevo", CARGOS, index=None)
+                    cf = st.date_input("Fecha inicio nuevo cargo", value=None)
+                    if st.form_submit_button("Registrar cambio de cargo"):
+                        if cn is None or cf is None:
+                            st.error("Completa cargo y fecha.")
+                        else:
+                            try:
+                                with conn.session as con:
+                                    _aplicar_cambio_cargo(con, cid, cn, cf)
+                                    con.commit()
+                                auditar_rrhh("asignaciones", cid, "CAMBIO_CARGO",
+                                             {"cargo": est["cargo"]}, {"cargo": cn, "fecha": str(cf)})
+                                st.success("Cambio registrado.")
+                                st.rerun()
+                            except Exception as e:
+                                st.error(f"{e}")
+
+            # --- PERIODO DE PRUEBA (separado de inactivación) ---
+            with st.expander("Periodo de prueba"):
+                with st.form("form_prueba"):
+                    q1, q2 = st.columns(2)
+                    n_pr = q1.radio("En prueba", ["NO", "SI"],
+                                    index=1 if est["en_prueba"] else 0, horizontal=True) == "SI"
+                    n_pi = q1.date_input("Inicio prueba", value=est["prueba_inicio"])
+                    n_pf = q2.date_input("Fin prueba", value=est["prueba_fin"])
+                    if st.form_submit_button("Guardar periodo de prueba"):
+                        errs = []
+                        if n_pr and (n_pi is None or n_pf is None or n_pf <= n_pi):
+                            errs.append("Fechas de prueba inválidas.")
+                        if errs:
+                            st.error("\n".join(errs))
+                        else:
+                            with conn.session as con:
+                                con.execute(text("""
+                                    UPDATE rrhh.colaboradores SET en_prueba=:pr, prueba_inicio=:pi, prueba_fin=:pf
+                                    WHERE id=:c
+                                """), {"pr": n_pr, "pi": n_pi, "pf": n_pf, "c": cid})
+                                con.commit()
+                            auditar_rrhh("colaboradores", cid, "UPDATE_PRUEBA",
+                                         {"en_prueba": bool(est["en_prueba"])},
+                                         {"en_prueba": n_pr, "inicio": str(n_pi), "fin": str(n_pf)})
+                            st.success("Periodo de prueba guardado.")
+                            st.rerun()
+
+            # --- INACTIVAR / REACTIVAR (expander separado) ---
+            with st.expander("Estado del colaborador (activo / inactivo)"):
+                with st.form("form_estado"):
+                    if est["activo"]:
+                        n_ina = st.checkbox("Inactivar colaborador")
+                        n_fi = st.date_input("Fecha de inactividad", value=None, disabled=not n_ina)
+                        if st.form_submit_button("Aplicar cambio de estado"):
+                            if n_ina and n_fi is None:
+                                st.error("Indica la fecha de inactividad.")
+                            elif not n_ina:
+                                st.info("No se hicieron cambios.")
+                            else:
+                                with conn.session as con:
+                                    con.execute(text("""
+                                        UPDATE rrhh.colaboradores SET activo=FALSE, fecha_inactividad=:fi WHERE id=:c
+                                    """), {"fi": n_fi, "c": cid})
+                                    con.commit()
+                                auditar_rrhh("colaboradores", cid, "INACTIVAR",
+                                             {"activo": True},
+                                             {"activo": False, "fecha_inactividad": str(n_fi)})
+                                st.success("Colaborador inactivado.")
+                                st.rerun()
+                    else:
+                        n_rea = st.checkbox("Reactivar colaborador")
+                        n_fr = st.date_input("Fecha de reingreso", value=None, disabled=not n_rea)
+                        if st.form_submit_button("Aplicar cambio de estado"):
+                            if n_rea and n_fr is None:
+                                st.error("Indica la fecha de reingreso.")
+                            elif not n_rea:
+                                st.info("No se hicieron cambios.")
+                            else:
+                                with conn.session as con:
+                                    con.execute(text("""
+                                        UPDATE rrhh.colaboradores SET activo=TRUE, fecha_inactividad=NULL WHERE id=:c
+                                    """), {"c": cid})
+                                    con.commit()
+                                auditar_rrhh("colaboradores", cid, "REACTIVAR",
+                                             {"activo": False},
+                                             {"activo": True, "fecha_reingreso": str(n_fr)})
+                                st.success("Colaborador reactivado.")
+                                st.rerun()
+
+# ------------------------------------------------------------
+# DISTRIBUCIÓN POR ALMACÉN
+# ------------------------------------------------------------
+with tab_dist:
+    st.caption("Regla de oro: por almacén y vigencia, la suma de % debe dar 100%.")
+    alm = conn.query("SELECT codigo, nombre_serie FROM app.almacenes WHERE activo=TRUE ORDER BY codigo", ttl=0)
+    if alm.empty:
+        st.warning("app.almacenes vacía.")
     else:
-        map_col = {f"{r['nombre']} — CC {r['cedula']}": r["id"] for _, r in cols_a.iterrows()}
-        map_alm_a = dict(zip(alm_a["codigo"], alm_a["nombre_serie"].fillna(alm_a["codigo"])))
-        cargos_existentes = conn.query(
-            "SELECT DISTINCT cargo FROM rrhh.distribucion_puestos ORDER BY cargo", ttl=0)["cargo"].tolist()
-
-        with st.form("form_asig"):
-            a1, a2, a3, a4 = st.columns(4)
-            with a1:
-                sel_col_a = st.selectbox("Colaborador *", list(map_col.keys()))
-            with a2:
-                sel_alm_a = st.selectbox("Almacén *", list(map_alm_a.keys()),
-                                         format_func=lambda k: f"{k} — {map_alm_a[k]}")
-            with a3:
-                sel_cargo = st.text_input("Cargo * (debe existir en la plantilla)",
-                                          value=cargos_existentes[0] if cargos_existentes else "")
-            with a4:
-                fdesde = st.date_input("Desde *")
-                hasta = st.date_input("Hasta (vacío = vigente)", value=None)
-            asig_btn = st.form_submit_button("💾 Guardar asignación")
-
-        if asig_btn:
-            cid = map_col[sel_col_a]
-            conflictos = validar_solape_asignacion(cid, fdesde, hasta)
-            if not sel_cargo.strip():
-                st.error("El cargo es obligatorio.")
-            elif conflictos:
-                st.error("❌ Solape detectado:\n" + "\n".join(conflictos))
-            else:
-                # Validación blanda: ¿el cargo existe en la plantilla vigente de ese almacén?
-                plant_ok = conn.query("""
-                    SELECT 1 FROM rrhh.distribucion_puestos
-                    WHERE almacen = :a AND cargo = :c
-                      AND vigente_desde <= :fd
-                      AND (vigente_hasta IS NULL OR vigente_hasta >= :fd)
-                """, {"a": sel_alm_a, "c": sel_cargo.strip(), "fd": fdesde}, ttl=0)
-                if plant_ok.empty:
-                    st.warning(f"⚠️ El cargo '{sel_cargo}' no está en la plantilla vigente de "
-                               f"{sel_alm_a}. Se guarda igual, pero revisa la pestaña de distribución.")
-                with conn.session as con:
-                    res = con.execute(text("""
-                        INSERT INTO rrhh.asignaciones
-                            (colaborador_id, almacen, cargo, fecha_desde, fecha_hasta)
-                        VALUES (:cid, :alm, :car, :fd, :fh) RETURNING id
-                    """), {"cid": cid, "alm": sel_alm_a, "car": sel_cargo.strip(),
-                           "fd": fdesde, "fh": hasta})
-                    aid = res.fetchone()[0]
-                    con.commit()
-                auditar_rrhh("asignaciones", aid, "CREATE", None,
-                             {"colaborador": sel_col_a, "almacen": sel_alm_a,
-                              "cargo": sel_cargo.strip(), "desde": str(fdesde),
-                              "hasta": str(hasta) if hasta else None})
-                st.success(f"✅ Asignación #{aid} guardada.")
-                st.rerun()
-
-        st.markdown("---")
-        st.subheader("Historial de asignaciones")
-        df_as = conn.query("""
-            SELECT a.id, c.nombre, c.cedula, a.almacen, a.cargo,
-                   a.fecha_desde, COALESCE(a.fecha_hasta::TEXT, 'Vigente') AS fecha_hasta,
-                   (CURRENT_DATE < c.fecha_ingreso + make_interval(months => c.periodo_prueba_meses))
-                     AS en_periodo_prueba
-            FROM rrhh.asignaciones a
-            JOIN rrhh.colaboradores c ON c.id = a.colaborador_id
-            ORDER BY a.fecha_desde DESC LIMIT 300
-        """, ttl=0)
-        
-        if not df_as.empty:
-            st.dataframe(df_as, use_container_width=True, hide_index=True)
-            st.caption("`en_periodo_prueba = True` ⇒ ese colaborador NO recibe bono este mes.")
-            with st.expander("Cerrar una asignación vigente (poner fecha_hasta)"):
-                vigentes = df_as[df_as["fecha_hasta"] == "Vigente"]
-                if vigentes.empty:
-                    st.info("No hay asignaciones vigentes abiertas.")
+        map_alm = dict(zip(alm["codigo"], alm["nombre_serie"].fillna(alm["codigo"])))
+        sel_alm = st.selectbox("Almacén", list(map_alm.keys()), format_func=lambda k: f"{k} - {map_alm[k]}")
+        df_d = conn.query("""
+            SELECT id, almacen, cargo, pct, vigente_desde, vigente_hasta
+            FROM rrhh.distribucion_puestos WHERE almacen = :a
+            ORDER BY vigente_desde DESC, cargo
+        """, params={"a": sel_alm}, ttl=0)
+        if not df_d.empty:
+            for vig, tot in df_d.groupby("vigente_desde")["pct"].sum().items():
+                st.markdown(f"{'OK' if abs(float(tot)-100) < 0.001 else 'FALTA'} - Vigencia {vig}: {float(tot):.3f}%")
+            st.dataframe(df_d, use_container_width=True, hide_index=True)
+        with st.form("form_puesto"):
+            p1, p2, p3, p4 = st.columns(4)
+            cargo = p1.selectbox("Cargo *", CARGOS, index=None)
+            pct = p2.number_input("% del bono *", 0.0, 100.0, step=0.5)
+            v_desde = p3.date_input("Vigente desde *", value=None)
+            v_hasta = p4.date_input("Vigente hasta", value=None)
+            if st.form_submit_button("Guardar puesto"):
+                if cargo is None or pct <= 0 or v_desde is None:
+                    st.error("Cargo, % y vigencia son obligatorios.")
                 else:
-                    sel_id = st.selectbox("ID asignación", vigentes["id"].tolist())
-                    f_cierre = st.date_input("Fecha hasta", key="f_cierre_asig")
-                    if st.button("🔒 Cerrar asignación"):
-                        with conn.session as con:
-                            con.execute(text("""
-                                UPDATE rrhh.asignaciones SET fecha_hasta = :fh WHERE id = :i
-                            """), {"fh": f_cierre, "i": int(sel_id)})
-                            con.commit()
-                        auditar_rrhh("asignaciones", sel_id, "CERRAR",
-                                     {"fecha_hasta": None}, {"fecha_hasta": str(f_cierre)})
-                        st.success("Asignación cerrada.")
-                        st.rerun()
-        else:
-            st.info("Sin asignaciones registradas.")
+                    with conn.session as con:
+                        con.execute(text("""
+                            INSERT INTO rrhh.distribucion_puestos (almacen, cargo, pct, vigente_desde, vigente_hasta)
+                            VALUES (:a,:c,:p,:vd,:vh)
+                            ON CONFLICT (almacen, cargo, vigente_desde)
+                            DO UPDATE SET pct = EXCLUDED.pct, vigente_hasta = EXCLUDED.vigente_hasta
+                        """), {"a": sel_alm, "c": cargo, "p": float(pct), "vd": v_desde, "vh": v_hasta})
+                        con.commit()
+                    auditar_rrhh("distribucion_puestos", sel_alm, "UPSERT", None,
+                                 {"cargo": cargo, "pct": float(pct)})
+                    st.success("Puesto guardado.")
+                    st.rerun()
+
+# ------------------------------------------------------------
+# HISTORIAL (append-only: nunca se sobrescribe)
+# ------------------------------------------------------------
+with tab_hist:
+    st.caption("Cada cambio queda como una fila nueva. Si un colaborador se corrige 5 veces, verás 5 filas distintas con su 'antes' y 'después'.")
+    df_as = conn.query("""
+        SELECT a.id, c.nombre, c.cedula, a.almacen, a.cargo, a.fecha_desde,
+               COALESCE(a.fecha_hasta::TEXT, 'Vigente') AS fecha_hasta
+        FROM rrhh.asignaciones a JOIN rrhh.colaboradores c ON c.id = a.colaborador_id
+        ORDER BY a.fecha_desde DESC LIMIT 300
+    """, ttl=0)
+    st.dataframe(df_as, use_container_width=True, hide_index=True)
+    with st.expander("Auditoría de cambios"):
+        df_h = conn.query("""
+            SELECT id, fecha, usuario, accion, tabla, registro_id, antes, despues
+            FROM rrhh.rrhh_auditoria
+            WHERE tabla IN ('colaboradores','asignaciones','distribucion_puestos')
+            ORDER BY fecha DESC LIMIT 300
+        """, ttl=0)
+        st.dataframe(df_h.drop(columns=["antes", "despues"]), use_container_width=True, hide_index=True)
+        with st.expander("Ver antes / después de un cambio"):
+            if not df_h.empty:
+                rid = st.selectbox("ID del registro", df_h["id"].tolist())
+                fila = df_h[df_h["id"] == rid].iloc[0]
+                c1, c2 = st.columns(2)
+                c1.json(fila["antes"] if fila["antes"] is not None else {})
+                c2.json(fila["despues"] if fila["despues"] is not None else {})
