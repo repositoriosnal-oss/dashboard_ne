@@ -126,6 +126,42 @@ def bootstrap_rrhh():
             # ---- Auditoría con nombre y rol del autor (migración idempotente) ----
             con.execute(text("ALTER TABLE rrhh.rrhh_auditoria ADD COLUMN IF NOT EXISTS rol TEXT"))
             con.execute(text("ALTER TABLE rrhh.rrhh_auditoria ADD COLUMN IF NOT EXISTS nombre_usuario TEXT"))
+
+            # ---- Novedades: dominical, observación y tipos ampliados ----
+            con.execute(text("ALTER TABLE rrhh.novedades ADD COLUMN IF NOT EXISTS "
+                             "incluye_dominical BOOLEAN NOT NULL DEFAULT FALSE"))            
+            con.execute(text("ALTER TABLE rrhh.novedades ADD COLUMN IF NOT EXISTS observacion TEXT"))
+
+            con.execute(text("ALTER TABLE rrhh.novedades ADD COLUMN IF NOT EXISTS creado_en TIMESTAMPTZ DEFAULT now()"))
+
+            con.execute(text("ALTER TABLE rrhh.novedades DROP CONSTRAINT IF EXISTS novedades_tipo_check"))
+            con.execute(text("""
+                ALTER TABLE rrhh.novedades ADD CONSTRAINT novedades_tipo_check CHECK (tipo IN
+                    ('FALTA','AUSENCIA','INCAPACIDAD','MEMORANDO','VACACIONES','PERMISO','PERIODO_PRUEBA'))
+            """))
+            # ---- % de descuento por grado de falta, con vigencias (versiones por periodo) ----
+            con.execute(text("""
+                CREATE TABLE IF NOT EXISTS rrhh.faltas_config (
+                    id            SERIAL PRIMARY KEY,
+                    tipo_falta_id INT NOT NULL REFERENCES rrhh.tipos_falta(id),
+                    pct_descuento NUMERIC NOT NULL CHECK (pct_descuento >= 0 AND pct_descuento <= 100),
+                    vigente_desde DATE NOT NULL,
+                    vigente_hasta DATE,
+                    UNIQUE (tipo_falta_id, vigente_desde)
+                )
+            """))
+            con.execute(text("""
+                INSERT INTO rrhh.faltas_config (tipo_falta_id, pct_descuento, vigente_desde)
+                SELECT tf.id,
+                       CASE tf.nombre WHEN 'Falta Tipo 1' THEN 15.0
+                                      WHEN 'Falta Tipo 2' THEN 30.0
+                                      WHEN 'Falta Tipo 3' THEN 45.0 END,
+                       DATE '2025-01-01'
+                FROM rrhh.tipos_falta tf
+                WHERE tf.nombre IN ('Falta Tipo 1','Falta Tipo 2','Falta Tipo 3')
+                ON CONFLICT (tipo_falta_id, vigente_desde) DO NOTHING
+            """))        
+            
                 
             con.commit()
         except Exception as e:
