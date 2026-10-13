@@ -43,7 +43,8 @@ def bootstrap_rrhh():
                     id            SERIAL PRIMARY KEY,
                     almacen       TEXT NOT NULL REFERENCES app.almacenes(codigo),
                     cargo         TEXT NOT NULL,
-                    pct           NUMERIC(6,3) NOT NULL CHECK (pct > 0 AND pct <= 100),
+                    pct           NUMERIC(6,3) NOT NULL CHECK (pct > 0 AND pct <= 100),  -- % POR PERSONA
+                    cupos         INT NOT NULL DEFAULT 1 CHECK (cupos >= 1),             -- personas en el cargo
                     vigente_desde DATE NOT NULL,
                     vigente_hasta DATE,
                     UNIQUE (almacen, cargo, vigente_desde)
@@ -121,6 +122,10 @@ def bootstrap_rrhh():
                     "daterange(fecha_desde, COALESCE(fecha_hasta, DATE '2100-12-31'), '[)') WITH &&)"))
             except Exception:
                 pass
+
+            # ---- Auditoría con nombre y rol del autor (migración idempotente) ----
+            con.execute(text("ALTER TABLE rrhh.rrhh_auditoria ADD COLUMN IF NOT EXISTS rol TEXT"))
+            con.execute(text("ALTER TABLE rrhh.rrhh_auditoria ADD COLUMN IF NOT EXISTS nombre_usuario TEXT"))
                 
             con.commit()
         except Exception as e:
@@ -128,27 +133,41 @@ def bootstrap_rrhh():
             raise e
 
 def auditar_rrhh(tabla, registro_id, accion, antes, despues):
-    """Auditoría estilo _auditar_bono, sobre rrhh.rrhh_auditoria."""
+    """Auditoría estilo _auditar_bono, sobre rrhh.rrhh_auditoria.
+    Registra login, nombre completo y rol de quien hace el cambio."""
     import json
     try:
         usuario = st.session_state.get("usuario_actual", "bootstrap")
+        rol = st.session_state.get("rol_actual", "bootstrap")
+        nombre = st.session_state.get("nombre_completo", usuario)
         with conn.session as con:
             con.execute(text("""
-                INSERT INTO rrhh.rrhh_auditoria (tabla, registro_id, accion, antes, despues, usuario)
-                VALUES (:t, :r, :a, :b::jsonb, :d::jsonb, :u)
+                INSERT INTO rrhh.rrhh_auditoria
+                    (tabla, registro_id, accion, antes, despues, usuario, rol, nombre_usuario)
+                VALUES (:t, :r, :a, CAST(:b AS jsonb), CAST(:d AS jsonb), :u, :rol, :nom)
             """), {
                 "t": tabla, "r": str(registro_id), "a": accion, "u": usuario,
-                "b": json.dumps(antes) if antes is not None else None,
-                "d": json.dumps(despues) if despues is not None else None,
+                "rol": rol, "nom": nombre,
+                "b": json.dumps(antes, default=str) if antes is not None else None,
+                "d": json.dumps(despues, default=str) if despues is not None else None,
             })
             con.commit()
-    except Exception:
-        pass  # la auditoría nunca debe romper la operación principal
+    except Exception as e:
+        # La auditoría no debe romper la operación principal, pero tampoco fallar en silencio
+        # (así pasó con el CAST de jsonb): se avisa en pantalla.
+        try:
+            st.warning(f"⚠️ No se pudo registrar la auditoría: {e}")
+        except Exception:
+            pass
 
 def validar_suma_100(df_plantilla):
     """Recibe DataFrame [almacen, cargo, pct, vigente_desde].
     Regla: POR ALMACÉN Y VIGENCIA, la suma de pct debe ser EXACTAMENTE 100."""
     errores = []
+    # El % de cada fila es POR PERSONA; el aporte del puesto es pct × cupos (cupos = 1 si no existe la columna).
+    df_plantilla = df_plantilla.copy()
+    cupos = df_plantilla["cupos"] if "cupos" in df_plantilla.columns else 1
+    df_plantilla["pct"] = df_plantilla["pct"].astype(float) * cupos
     grp = df_plantilla.groupby(["almacen", "vigente_desde"])["pct"].sum()
     for (alm, vig), total in grp.items():
         if abs(float(total) - 100.0) > 0.001:
@@ -196,4 +215,3 @@ except Exception as e:
         st.warning(f"⚠️ Bootstrap RRHH no ejecutado: {e}")
     except Exception:
         pass
-

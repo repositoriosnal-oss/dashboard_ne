@@ -1,23 +1,34 @@
+"""
+TALENTO HUMANO — Colaboradores: crear, editar, movimientos e historial.
+Los porcentajes del bono viven en views/rrhh_distribucion.py (solo Gerencia/Admin).
+Convención: asignaciones.fecha_hasta y colaboradores.fecha_inactividad son el
+ÚLTIMO DÍA trabajado (inclusivo); NULL = vigente.
+"""
 import io
+import re
 from datetime import date, timedelta
+
 import pandas as pd
 import streamlit as st
 from openpyxl.worksheet.datavalidation import DataValidation
 from sqlalchemy import text
+
 from src.conexion_db import conn
-from src.rrhh import ROLES_RRHH_CARGUE, auditar_rrhh, validar_suma_100
+from src.rrhh import ROLES_RRHH_CARGUE, auditar_rrhh
 
 st.set_page_config(page_title="Colaboradores RRHH", layout="wide")
-st.title("Talento Humano — Colaboradores y Distribución del Bono")
+st.title("Talento Humano — Colaboradores")
 st.markdown("---")
 
 rol = st.session_state.get("rol_actual")
 if rol not in ROLES_RRHH_CARGUE:
     st.error("Acceso denegado. Solo Talento Humano, Gerencia y Administración.")
     st.stop()
+#st.caption("Los porcentajes del bono por almacén/cargo se definen en "
+#           "**Distribución del Bono** (Gerencia/Administración).")
 
 # ============================================================
-# CATÁLOGOS ESTÁNDAR
+# CATÁLOGOS
 # ============================================================
 ALMACENES = [
     ("ALM128", "NORTE128"), ("ALM134", "PUNTO 134"), ("ALM170", "PUNTO170"),
@@ -28,11 +39,8 @@ ALMACENES = [
 ]
 ALM_COD = dict(ALMACENES)
 ALM_NORM = {**{c: c for c, _ in ALMACENES}, **{n: c for c, n in ALMACENES}}
-CARGOS = [
-    "Gerente Punto", "Ejecutivo Comercial",
-    "Vendedor 1", "Vendedor 2", "Vendedor 3",
-    "Cajera", "Bodega 1", "Bodega 2", "Conductor",
-]
+CARGOS = ["Gerente Punto", "Ejecutivo Comercial", "Vendedor 1", "Vendedor 2",
+          "Vendedor 3", "Cajera", "Bodega 1", "Bodega 2", "Conductor"]
 
 # ============================================================
 # MIGRACIÓN IDEMPOTENTE
@@ -50,7 +58,7 @@ with conn.session as con:
     con.commit()
 
 # ============================================================
-# HELPERS DE NEGOCIO
+# HELPERS DE NEGOCIO (misma transacción => sin solapes falsos)
 # ============================================================
 def _pdate(v):
     if v is None or (isinstance(v, float) and pd.isna(v)) or str(v).strip() == "":
@@ -59,7 +67,6 @@ def _pdate(v):
     return None if pd.isna(d) else d.date()
 
 def _cedula_ok(c):
-    import re
     return bool(c) and re.fullmatch(r"\d{5,12}", c) is not None
 
 def _solape(con, cid, desde, hasta, excluir_id=None):
@@ -81,7 +88,7 @@ def _nueva_asignacion(con, cid, almacen, cargo, desde, hasta=None):
     conf = _solape(con, cid, desde, hasta)
     if conf:
         r = conf[0]
-        raise ValueError(f"Solape con {r[1]}/{r[2]} ({r[3]} -> {r[4]}).")
+        raise ValueError(f"Solape con {r[1]}/{r[2]} ({r[3]} → {r[4]}).")
     res = con.execute(text("""
         INSERT INTO rrhh.asignaciones (colaborador_id, almacen, cargo, fecha_desde, fecha_hasta)
         VALUES (:c, :a, :g, :fd, :fh) RETURNING id
@@ -118,26 +125,64 @@ def _aplicar_cambio_cargo(con, cid, nuevo_cargo, fecha):
     con.execute(text("UPDATE rrhh.colaboradores SET cargo_actual = :g WHERE id = :c"),
                 {"g": nuevo_cargo, "c": cid})
 
-def _upsert_colaborador(con, d):
+def _inactivar(con, cid, fecha):
+    """Inactiva y CIERRA la asignación vigente en `fecha` (último día trabajado): libera el % del bono."""
+    v = _vigente(con, cid)
+    if v is not None and fecha < v[3]:
+        raise ValueError(f"La fecha de inactividad ({fecha}) es anterior al inicio de su asignación vigente ({v[3]}).")
+    if v is not None:
+        con.execute(text("UPDATE rrhh.asignaciones SET fecha_hasta = :fh WHERE id = :id"),
+                    {"fh": fecha, "id": v[0]})
+    con.execute(text("UPDATE rrhh.colaboradores SET activo = FALSE, fecha_inactividad = :fi WHERE id = :c"),
+                {"fi": fecha, "c": cid})
+
+def _reactivar(con, cid, fecha):
+    """Reactiva y ABRE una asignación nueva desde `fecha` en el último almacén/cargo."""
+    est = con.execute(text("SELECT almacen_actual, cargo_actual, fecha_inactividad "
+                           "FROM rrhh.colaboradores WHERE id = :c"), {"c": cid}).fetchone()
+    fi = est[2]
+    if fi and fecha <= fi:
+        raise ValueError(f"El reingreso ({fecha}) debe ser posterior a la fecha de inactividad ({fi}).")
+    ult = con.execute(text("SELECT almacen, cargo FROM rrhh.asignaciones WHERE colaborador_id = :c "
+                           "ORDER BY fecha_desde DESC LIMIT 1"), {"c": cid}).fetchone()
+    alm = est[0] or (ult[0] if ult else None)
+    car = est[1] or (ult[1] if ult else None)
+    if not alm or not car:
+        raise ValueError("No tiene almacén/cargo registrado: créale primero la asignación inicial.")
+    if fi:  # datos anteriores: la asignación pudo quedar abierta al inactivar
+        con.execute(text("UPDATE rrhh.asignaciones SET fecha_hasta = :fh "
+                         "WHERE colaborador_id = :c AND fecha_hasta IS NULL"), {"fh": fi, "c": cid})
+    _nueva_asignacion(con, cid, alm, car, fecha)
+    con.execute(text("UPDATE rrhh.colaboradores SET activo = TRUE, fecha_inactividad = NULL, "
+                     "almacen_actual = :a, cargo_actual = :g WHERE id = :c"),
+                {"a": alm, "g": car, "c": cid})
+
+def _existe(con, cedula):
+    return con.execute(text("SELECT id FROM rrhh.colaboradores WHERE cedula = :c"),
+                       {"c": cedula}).fetchone()
+
+def _crear_colaborador(con, d):
     res = con.execute(text("""
         INSERT INTO rrhh.colaboradores
             (cedula, nombre, slp_code, owner_code, usuario_portal, fecha_ingreso,
              periodo_prueba_meses, activo, almacen_actual, cargo_actual,
              en_prueba, prueba_inicio, prueba_fin, fecha_inactividad)
         VALUES (:ced,:nom,:slp,:own,:por,:ing,2,:act,:alm,:car,:pr,:pi,:pf,:fi)
-        ON CONFLICT (cedula) DO UPDATE SET
-            nombre = EXCLUDED.nombre, slp_code = EXCLUDED.slp_code,
-            owner_code = EXCLUDED.owner_code, usuario_portal = EXCLUDED.usuario_portal,
-            fecha_ingreso = EXCLUDED.fecha_ingreso, activo = EXCLUDED.activo,
-            almacen_actual = EXCLUDED.almacen_actual, cargo_actual = EXCLUDED.cargo_actual,
-            en_prueba = EXCLUDED.en_prueba, prueba_inicio = EXCLUDED.prueba_inicio,
-            prueba_fin = EXCLUDED.prueba_fin, fecha_inactividad = EXCLUDED.fecha_inactividad
         RETURNING id
     """), d)
     return res.fetchone()[0]
 
+def _actualizar_datos_basicos(con, cid, d):
+    """Recarga/edición segura: NUNCA pisa estado, fechas de movimiento ni puesto."""
+    con.execute(text("""
+        UPDATE rrhh.colaboradores SET
+            nombre = :nom, slp_code = :slp, owner_code = :own, usuario_portal = :por,
+            en_prueba = :pr, prueba_inicio = :pi, prueba_fin = :pf
+        WHERE id = :cid
+    """), {**d, "cid": cid})
+
 # ============================================================
-# PLANTILLA EXCEL (solo columnas de creación)
+# PLANTILLA EXCEL (solo columnas de creación, con desplegables)
 # ============================================================
 def construir_plantilla():
     cols = ["cedula", "nombre", "almacen", "cargo", "fecha_ingreso",
@@ -173,9 +218,8 @@ def construir_plantilla():
 # ============================================================
 # PESTAÑAS
 # ============================================================
-tab_res, tab_new, tab_edit, tab_dist, tab_hist = st.tabs(
-    ["Resumen", "Crear y carga masiva", "Editar / Movimientos",
-     "Distribución por Almacén", "Historial"])
+tab_res, tab_new, tab_edit, tab_hist = st.tabs(
+    ["Resumen", "Crear y carga masiva", "Editar / Movimientos", "Historial"])
 
 # ------------------------------------------------------------
 # RESUMEN
@@ -221,7 +265,7 @@ with tab_res:
 with tab_new:
     modo = st.radio("Cómo cargar", ["Formulario individual", "Carga masiva (Excel)"], horizontal=True)
     if modo.startswith("Formulario"):
-        # --- Datos fuera del form para renderizado dinámico del periodo de prueba ---
+        # Widgets FUERA del form para render dinámico; el form solo agrupa el submit.
         c1, c2, c3 = st.columns(3)
         ced = c1.text_input("Cédula *", key="new_ced")
         nom = c2.text_input("Nombre completo *", key="new_nom")
@@ -231,17 +275,12 @@ with tab_new:
                            index=None, key="new_alm")
         car = c2.selectbox("Cargo *", CARGOS, index=None, key="new_car")
         prb = c3.radio("Periodo de prueba", ["NO", "SI"], horizontal=True, key="new_prb")
-
-        # Periodo de prueba: se renderiza dinámicamente al elegir SI
         p_ini = p_fin = None
         if prb == "SI":
             c1, c2 = st.columns(2)
-            p_ini = c1.date_input("Inicio periodo de prueba",
-                                  value=f_ing, key="new_pi")
+            p_ini = c1.date_input("Inicio periodo de prueba", value=f_ing, key="new_pi")
             p_fin = c2.date_input("Fin periodo de prueba",
-                                  value=(f_ing + timedelta(days=60)) if f_ing else None,
-                                  key="new_pf")
-
+                                  value=(f_ing + timedelta(days=60)) if f_ing else None, key="new_pf")
         with st.form("form_alta_submit"):
             if st.form_submit_button("Crear colaborador", type="primary"):
                 errs = []
@@ -258,23 +297,24 @@ with tab_new:
                             errs.append("El inicio de la prueba no puede ser anterior al ingreso.")
                         if p_fin <= p_ini:
                             errs.append("El fin de la prueba debe ser posterior al inicio.")
+                with conn.session as con:
+                    if not errs and _existe(con, ced.strip()):
+                        errs.append("La cédula ya existe: edítela en 'Editar / Movimientos'.")
                 if errs:
                     st.error("Corrige:\n" + "\n".join(errs))
                 else:
                     try:
                         with conn.session as con:
-                            cid = _upsert_colaborador(con, {
+                            cid = _crear_colaborador(con, {
                                 "ced": ced.strip(), "nom": nom.strip(),
                                 "slp": None, "own": None, "por": None, "ing": f_ing,
                                 "act": True, "alm": alm[0], "car": car,
                                 "pr": prb == "SI", "pi": p_ini, "pf": p_fin, "fi": None})
-                            if not con.execute(text(
-                                "SELECT 1 FROM rrhh.asignaciones WHERE colaborador_id=:c LIMIT 1"),
-                                    {"c": cid}).fetchone():
-                                _nueva_asignacion(con, cid, alm[0], car, f_ing)
+                            _nueva_asignacion(con, cid, alm[0], car, f_ing)
                             con.commit()
                         auditar_rrhh("colaboradores", cid, "CREAR", None,
-                                     {"cedula": ced.strip(), "nombre": nom.strip()})
+                                     {"cedula": ced.strip(), "nombre": nom.strip(),
+                                      "almacen": alm[0], "cargo": car})
                         st.success(f"Colaborador {nom} creado (activo).")
                         st.rerun()
                     except Exception as e:
@@ -297,6 +337,8 @@ with tab_new:
                             continue
                         if not _cedula_ok(ced):
                             errs.append(f"Fila {i+2}: cédula inválida."); continue
+                        if _existe(con, ced):
+                            errs.append(f"Fila {i+2}: la cédula {ced} ya existe."); continue
                         alm_c = ALM_NORM.get(str(r.get("almacen", "")).strip())
                         car_v = str(r.get("cargo", "")).strip()
                         if not alm_c or car_v not in CARGOS:
@@ -308,14 +350,11 @@ with tab_new:
                         pi, pf = _pdate(r.get("prueba_inicio")), _pdate(r.get("prueba_fin"))
                         if pr and (pi is None or pf is None or pf <= pi or pi < f_ing):
                             errs.append(f"Fila {i+2}: fechas de prueba inválidas."); continue
-                        cid = _upsert_colaborador(con, {
+                        cid = _crear_colaborador(con, {
                             "ced": ced, "nom": nom, "slp": None, "own": None, "por": None,
                             "ing": f_ing, "act": True, "alm": alm_c, "car": car_v,
                             "pr": pr, "pi": pi, "pf": pf, "fi": None})
-                        if not con.execute(text(
-                            "SELECT 1 FROM rrhh.asignaciones WHERE colaborador_id=:c LIMIT 1"),
-                                {"c": cid}).fetchone():
-                            _nueva_asignacion(con, cid, alm_c, car_v, f_ing)
+                        _nueva_asignacion(con, cid, alm_c, car_v, f_ing)
                         ok += 1
                     if errs:
                         con.rollback()
@@ -357,7 +396,6 @@ with tab_edit:
             m3.metric("Estado", "ACTIVO" if est["activo"] else "INACTIVO")
             m4.metric("Prueba", "SÍ" if est["en_prueba"] else "NO")
 
-            # --- DATOS BÁSICOS ---
             with st.expander("Datos básicos (corrige errores de carga)"):
                 with st.form("form_basic"):
                     n_nom = st.text_input("Nombre completo", value=est["nombre"])
@@ -374,24 +412,20 @@ with tab_edit:
                         else:
                             antes = {"nombre": est["nombre"], "cedula": est["cedula"]}
                             with conn.session as con:
-                                con.execute(text("""
-                                    UPDATE rrhh.colaboradores SET nombre=:nom, cedula=:ced
-                                    WHERE id=:c
-                                """), {"nom": n_nom.strip(), "ced": n_ced.strip(), "c": cid})
+                                con.execute(text("UPDATE rrhh.colaboradores SET nombre=:nom, cedula=:ced WHERE id=:c"),
+                                            {"nom": n_nom.strip(), "ced": n_ced.strip(), "c": cid})
                                 con.commit()
                             auditar_rrhh("colaboradores", cid, "UPDATE_DATOS", antes,
                                          {"nombre": n_nom.strip(), "cedula": n_ced.strip()})
                             st.success("Datos básicos guardados.")
                             st.rerun()
 
-            # --- ASIGNACIÓN VIGENTE (corregir o crear inicial) ---
             with st.expander("Asignación de puesto (almacén/cargo)"):
                 if est["asig_id"] is None:
-                    st.warning("Este colaborador no tiene asignación vigente. Puedes crearla ahora (caso típico: se creó sin almacén por error).")
+                    st.warning("Sin asignación vigente (caso típico: se creó sin almacén por error).")
                     with st.form("form_creacion_asig"):
                         a1, a2, a3 = st.columns(3)
-                        ca = a1.selectbox("Almacén", ALMACENES,
-                                          format_func=lambda x: f"{x[0]} - {x[1]}", index=None)
+                        ca = a1.selectbox("Almacén", ALMACENES, format_func=lambda x: f"{x[0]} - {x[1]}", index=None)
                         cc = a2.selectbox("Cargo", CARGOS, index=None)
                         cd = a3.date_input("Fecha desde", value=est["fecha_ingreso"])
                         if st.form_submit_button("Crear asignación inicial"):
@@ -401,10 +435,8 @@ with tab_edit:
                                 try:
                                     with conn.session as con:
                                         _nueva_asignacion(con, cid, ca[0], cc, cd)
-                                        con.execute(text("""
-                                            UPDATE rrhh.colaboradores SET almacen_actual=:a, cargo_actual=:g
-                                            WHERE id=:c
-                                        """), {"a": ca[0], "g": cc, "c": cid})
+                                        con.execute(text("UPDATE rrhh.colaboradores SET almacen_actual=:a, cargo_actual=:g WHERE id=:c"),
+                                                    {"a": ca[0], "g": cc, "c": cid})
                                         con.commit()
                                     auditar_rrhh("asignaciones", cid, "CREAR_ASIGNACION_INICIAL", None,
                                                  {"almacen": ca[0], "cargo": cc, "desde": str(cd)})
@@ -413,7 +445,7 @@ with tab_edit:
                                 except Exception as e:
                                     st.error(f"{e}")
                 else:
-                    st.caption("Corrección: reescribe almacén/cargo de la asignación vigente sin crear historial de movimientos. El cambio queda auditado.")
+                    st.caption("Corrección: reescribe almacén/cargo de la asignación vigente sin crear movimiento. Queda auditado.")
                     with st.form("form_corr_asig"):
                         a1, a2 = st.columns(2)
                         ca = a1.selectbox("Almacén", ALMACENES, format_func=lambda x: f"{x[0]} - {x[1]}",
@@ -431,18 +463,16 @@ with tab_edit:
                                     con.execute(text("UPDATE rrhh.colaboradores SET almacen_actual=:a, cargo_actual=:g WHERE id=:c"),
                                                 {"a": ca[0], "g": cc, "c": cid})
                                     con.commit()
-                                auditar_rrhh("asignaciones", est["asig_id"], "CORRECCION_ASIGNACION",
-                                             antes, {"almacen": ca[0], "cargo": cc})
+                                auditar_rrhh("asignaciones", cid, "CORRECCION_ASIGNACION",
+                                            antes, {"asig_id": est["asig_id"], "almacen": ca[0], "cargo": cc})
                                 st.success("Asignación vigente corregida.")
                                 st.rerun()
 
-            # --- TRASLADO ---
             with st.expander("Traslado de punto de venta (movimiento real)"):
                 with st.form("form_traslado"):
                     t1, t2, t3c = st.columns(3)
                     t1.markdown(f"Origen actual: **{est['almacen'] or '—'}**")
-                    td = t2.selectbox("Almacén destino", ALMACENES,
-                                      format_func=lambda x: f"{x[0]} - {x[1]}", index=None)
+                    td = t2.selectbox("Almacén destino", ALMACENES, format_func=lambda x: f"{x[0]} - {x[1]}", index=None)
                     tf = t3c.date_input("Fecha fin en origen", value=None)
                     ti = st.date_input("Fecha inicio en destino", value=None)
                     if st.form_submit_button("Registrar traslado"):
@@ -461,7 +491,6 @@ with tab_edit:
                             except Exception as e:
                                 st.error(f"{e}")
 
-            # --- CAMBIO DE CARGO ---
             with st.expander("Cambio de cargo (movimiento real)"):
                 with st.form("form_cargo"):
                     h1, h2 = st.columns(2)
@@ -483,26 +512,19 @@ with tab_edit:
                             except Exception as e:
                                 st.error(f"{e}")
 
-            # --- PERIODO DE PRUEBA (separado de inactivación) ---
             with st.expander("Periodo de prueba"):
                 with st.form("form_prueba"):
                     q1, q2 = st.columns(2)
-                    n_pr = q1.radio("En prueba", ["NO", "SI"],
-                                    index=1 if est["en_prueba"] else 0, horizontal=True) == "SI"
+                    n_pr = q1.radio("En prueba", ["NO", "SI"], index=1 if est["en_prueba"] else 0, horizontal=True) == "SI"
                     n_pi = q1.date_input("Inicio prueba", value=est["prueba_inicio"])
                     n_pf = q2.date_input("Fin prueba", value=est["prueba_fin"])
                     if st.form_submit_button("Guardar periodo de prueba"):
-                        errs = []
                         if n_pr and (n_pi is None or n_pf is None or n_pf <= n_pi):
-                            errs.append("Fechas de prueba inválidas.")
-                        if errs:
-                            st.error("\n".join(errs))
+                            st.error("Fechas de prueba inválidas.")
                         else:
                             with conn.session as con:
-                                con.execute(text("""
-                                    UPDATE rrhh.colaboradores SET en_prueba=:pr, prueba_inicio=:pi, prueba_fin=:pf
-                                    WHERE id=:c
-                                """), {"pr": n_pr, "pi": n_pi, "pf": n_pf, "c": cid})
+                                con.execute(text("UPDATE rrhh.colaboradores SET en_prueba=:pr, prueba_inicio=:pi, prueba_fin=:pf WHERE id=:c"),
+                                            {"pr": n_pr, "pi": n_pi, "pf": n_pf, "c": cid})
                                 con.commit()
                             auditar_rrhh("colaboradores", cid, "UPDATE_PRUEBA",
                                          {"en_prueba": bool(est["en_prueba"])},
@@ -510,96 +532,145 @@ with tab_edit:
                             st.success("Periodo de prueba guardado.")
                             st.rerun()
 
-            # --- INACTIVAR / REACTIVAR (expander separado) ---
+            # --- ESTADO: SIN st.form a propósito (el checkbox habilita la fecha al instante) ---
             with st.expander("Estado del colaborador (activo / inactivo)"):
-                with st.form("form_estado"):
-                    if est["activo"]:
-                        n_ina = st.checkbox("Inactivar colaborador")
-                        n_fi = st.date_input("Fecha de inactividad", value=None, disabled=not n_ina)
-                        if st.form_submit_button("Aplicar cambio de estado"):
-                            if n_ina and n_fi is None:
-                                st.error("Indica la fecha de inactividad.")
-                            elif not n_ina:
-                                st.info("No se hicieron cambios.")
-                            else:
+                if est["activo"]:
+                    n_ina = st.checkbox("Inactivar colaborador", key=f"chk_ina_{cid}")
+                    n_fi = st.date_input("Fecha de inactividad (último día trabajado)",
+                                         value=None, disabled=not n_ina, key=f"fi_ina_{cid}")
+                    if st.button("Aplicar cambio de estado", type="primary", key=f"btn_ina_{cid}"):
+                        if not n_ina:
+                            st.info("Marca la casilla para inactivar.")
+                        elif n_fi is None:
+                            st.error("Indica la fecha de inactividad.")
+                        else:
+                            try:
                                 with conn.session as con:
-                                    con.execute(text("""
-                                        UPDATE rrhh.colaboradores SET activo=FALSE, fecha_inactividad=:fi WHERE id=:c
-                                    """), {"fi": n_fi, "c": cid})
+                                    _inactivar(con, cid, n_fi)
                                     con.commit()
                                 auditar_rrhh("colaboradores", cid, "INACTIVAR",
-                                             {"activo": True},
-                                             {"activo": False, "fecha_inactividad": str(n_fi)})
-                                st.success("Colaborador inactivado.")
+                                             {"activo": True, "almacen": est["almacen"], "cargo": est["cargo"]},
+                                             {"activo": False, "fecha_inactividad": str(n_fi),
+                                              "asignacion_cerrada_el": str(n_fi)})
+                                st.success("Colaborador inactivado: su asignación quedó cerrada y su % "
+                                           "del bono se libera desde el día siguiente.")
                                 st.rerun()
-                    else:
-                        n_rea = st.checkbox("Reactivar colaborador")
-                        n_fr = st.date_input("Fecha de reingreso", value=None, disabled=not n_rea)
-                        if st.form_submit_button("Aplicar cambio de estado"):
-                            if n_rea and n_fr is None:
-                                st.error("Indica la fecha de reingreso.")
-                            elif not n_rea:
-                                st.info("No se hicieron cambios.")
-                            else:
+                            except Exception as e:
+                                st.error(f"{e}")
+                else:
+                    n_rea = st.checkbox("Reactivar colaborador", key=f"chk_rea_{cid}")
+                    n_fr = st.date_input("Fecha de reingreso", value=None,
+                                         disabled=not n_rea, key=f"fi_rea_{cid}")
+                    if st.button("Aplicar cambio de estado", type="primary", key=f"btn_rea_{cid}"):
+                        if not n_rea:
+                            st.info("Marca la casilla para reactivar.")
+                        elif n_fr is None:
+                            st.error("Indica la fecha de reingreso.")
+                        else:
+                            try:
                                 with conn.session as con:
-                                    con.execute(text("""
-                                        UPDATE rrhh.colaboradores SET activo=TRUE, fecha_inactividad=NULL WHERE id=:c
-                                    """), {"c": cid})
+                                    _reactivar(con, cid, n_fr)
                                     con.commit()
                                 auditar_rrhh("colaboradores", cid, "REACTIVAR",
                                              {"activo": False},
                                              {"activo": True, "fecha_reingreso": str(n_fr)})
-                                st.success("Colaborador reactivado.")
+                                st.success("Colaborador reactivado con asignación nueva desde el reingreso.")
                                 st.rerun()
-
-# ------------------------------------------------------------
-# DISTRIBUCIÓN POR ALMACÉN
-# ------------------------------------------------------------
-with tab_dist:
-    st.caption("Regla de oro: por almacén y vigencia, la suma de % debe dar 100%.")
-    alm = conn.query("SELECT codigo, nombre_serie FROM app.almacenes WHERE activo=TRUE ORDER BY codigo", ttl=0)
-    if alm.empty:
-        st.warning("app.almacenes vacía.")
-    else:
-        map_alm = dict(zip(alm["codigo"], alm["nombre_serie"].fillna(alm["codigo"])))
-        sel_alm = st.selectbox("Almacén", list(map_alm.keys()), format_func=lambda k: f"{k} - {map_alm[k]}")
-        df_d = conn.query("""
-            SELECT id, almacen, cargo, pct, vigente_desde, vigente_hasta
-            FROM rrhh.distribucion_puestos WHERE almacen = :a
-            ORDER BY vigente_desde DESC, cargo
-        """, params={"a": sel_alm}, ttl=0)
-        if not df_d.empty:
-            for vig, tot in df_d.groupby("vigente_desde")["pct"].sum().items():
-                st.markdown(f"{'OK' if abs(float(tot)-100) < 0.001 else 'FALTA'} - Vigencia {vig}: {float(tot):.3f}%")
-            st.dataframe(df_d, use_container_width=True, hide_index=True)
-        with st.form("form_puesto"):
-            p1, p2, p3, p4 = st.columns(4)
-            cargo = p1.selectbox("Cargo *", CARGOS, index=None)
-            pct = p2.number_input("% del bono *", 0.0, 100.0, step=0.5)
-            v_desde = p3.date_input("Vigente desde *", value=None)
-            v_hasta = p4.date_input("Vigente hasta", value=None)
-            if st.form_submit_button("Guardar puesto"):
-                if cargo is None or pct <= 0 or v_desde is None:
-                    st.error("Cargo, % y vigencia son obligatorios.")
-                else:
-                    with conn.session as con:
-                        con.execute(text("""
-                            INSERT INTO rrhh.distribucion_puestos (almacen, cargo, pct, vigente_desde, vigente_hasta)
-                            VALUES (:a,:c,:p,:vd,:vh)
-                            ON CONFLICT (almacen, cargo, vigente_desde)
-                            DO UPDATE SET pct = EXCLUDED.pct, vigente_hasta = EXCLUDED.vigente_hasta
-                        """), {"a": sel_alm, "c": cargo, "p": float(pct), "vd": v_desde, "vh": v_hasta})
-                        con.commit()
-                    auditar_rrhh("distribucion_puestos", sel_alm, "UPSERT", None,
-                                 {"cargo": cargo, "pct": float(pct)})
-                    st.success("Puesto guardado.")
-                    st.rerun()
+                            except Exception as e:
+                                st.error(f"{e}")
 
 # ------------------------------------------------------------
 # HISTORIAL (append-only: nunca se sobrescribe)
 # ------------------------------------------------------------
 with tab_hist:
-    st.caption("Cada cambio queda como una fila nueva. Si un colaborador se corrige 5 veces, verás 5 filas distintas con su 'antes' y 'después'.")
+    st.caption("Cada cambio queda como una fila nueva con el colaborador afectado, "
+               "el antes → después, y el nombre y rol de quien lo hizo. Nada se edita ni se borra.")
+
+    # ---------- Auditoría de cambios (tabla principal) ----------
+    df_h = conn.query("""
+        SELECT a.id, a.fecha, a.usuario,
+               COALESCE(a.nombre_usuario, u.nombre_completo, a.usuario) AS nombre_usuario,
+               COALESCE(a.rol, u.rol) AS rol,
+               a.accion, a.tabla, a.registro_id, a.antes, a.despues
+        FROM rrhh.rrhh_auditoria a
+        LEFT JOIN app.usuarios_portal u ON u.usuario = a.usuario
+        WHERE a.tabla IN ('colaboradores','asignaciones')
+        ORDER BY a.fecha DESC LIMIT 300
+    """, ttl=0)
+
+    if df_h.empty:
+        st.info("Sin cambios registrados todavía.")
+    else:
+        # Catálogos para resolver a qué persona corresponde cada cambio
+        cols_map = conn.query("SELECT id, cedula, nombre FROM rrhh.colaboradores", ttl=0)
+        map_col = {int(r["id"]): (str(r["cedula"]), str(r["nombre"])) for _, r in cols_map.iterrows()}
+        asig_map = conn.query("SELECT id, colaborador_id FROM rrhh.asignaciones", ttl=0)
+        map_asig = {int(r["id"]): int(r["colaborador_id"]) for _, r in asig_map.iterrows()}
+
+        def _resolver_persona(accion, registro_id):
+            """registro_id suele ser el id del colaborador; en registros antiguos de
+            CORRECCION_ASIGNACION era el id de la asignación."""
+            rid = str(registro_id)
+            if not rid.isdigit():
+                return ("", "")                      # ej. carga masiva ("bulk")
+            i = int(rid)
+            if accion == "CORRECCION_ASIGNACION" and i in map_asig:
+                i = map_asig[i]
+            if i in map_col:
+                return map_col[i]
+            if i in map_asig and map_asig[i] in map_col:
+                return map_col[map_asig[i]]
+            return ("", "")
+
+        def _detalle(antes, despues):
+            """Resumen legible: 'campo: antes → después'."""
+            ant = antes if isinstance(antes, dict) else {}
+            des = despues if isinstance(despues, dict) else {}
+            if not ant:
+                return "; ".join(f"{k}: {v}" for k, v in des.items()) or "—"
+            partes = []
+            for k, v in des.items():
+                va = ant.get(k)
+                partes.append(f"{k}: {va} → {v}" if va != v else f"{k}: {v}")
+            return "; ".join(partes) if partes else "—"
+
+        pers = [_resolver_persona(r["accion"], r["registro_id"]) for _, r in df_h.iterrows()]
+        df_h["cedula_col"] = [p[0] for p in pers]
+        df_h["nombre_col"] = [p[1] for p in pers]
+        df_h["detalle"] = [_detalle(a, d) for a, d in zip(df_h["antes"], df_h["despues"])]
+
+        st.markdown("##### Auditoría de cambios")
+        st.dataframe(
+            df_h[["id", "fecha", "nombre_col", "cedula_col", "accion", "detalle",
+                  "usuario", "nombre_usuario", "rol", "tabla"]].rename(columns={
+                "id": "ID", "fecha": "Fecha", "nombre_col": "Colaborador",
+                "cedula_col": "Cédula", "accion": "Acción",
+                "detalle": "Detalle (antes → después)",
+                "usuario": "Usuario (login)", "nombre_usuario": "Nombre autor",
+                "rol": "Rol", "tabla": "Tabla"}),
+            use_container_width=True, hide_index=True,
+            column_config={
+                "Fecha": st.column_config.DatetimeColumn(format="DD/MM/YYYY HH:mm"),
+                "Colaborador": st.column_config.TextColumn(width="medium"),
+                "Cédula": st.column_config.TextColumn(width="small"),
+                "Acción": st.column_config.TextColumn(width="small"),
+                "Detalle (antes → después)": st.column_config.TextColumn(width="large"),
+                "Nombre autor": st.column_config.TextColumn(width="medium"),
+                "Rol": st.column_config.TextColumn(width="small"),
+                "Tabla": st.column_config.TextColumn(width="small"),
+            })
+
+        with st.expander("Ver antes / después completo (JSON) de un cambio"):
+            rid = st.selectbox("ID del registro", df_h["id"].tolist())
+            fila = df_h[df_h["id"] == rid].iloc[0]
+            c1, c2 = st.columns(2)
+            c1.markdown("**Antes**")
+            c1.json(fila["antes"] if fila["antes"] is not None else {})
+            c2.markdown("**Después**")
+            c2.json(fila["despues"] if fila["despues"] is not None else {})
+
+    # ---------- Línea de tiempo de asignaciones ----------
+    st.markdown("##### Línea de tiempo de asignaciones")
     df_as = conn.query("""
         SELECT a.id, c.nombre, c.cedula, a.almacen, a.cargo, a.fecha_desde,
                COALESCE(a.fecha_hasta::TEXT, 'Vigente') AS fecha_hasta
@@ -607,18 +678,3 @@ with tab_hist:
         ORDER BY a.fecha_desde DESC LIMIT 300
     """, ttl=0)
     st.dataframe(df_as, use_container_width=True, hide_index=True)
-    with st.expander("Auditoría de cambios"):
-        df_h = conn.query("""
-            SELECT id, fecha, usuario, accion, tabla, registro_id, antes, despues
-            FROM rrhh.rrhh_auditoria
-            WHERE tabla IN ('colaboradores','asignaciones','distribucion_puestos')
-            ORDER BY fecha DESC LIMIT 300
-        """, ttl=0)
-        st.dataframe(df_h.drop(columns=["antes", "despues"]), use_container_width=True, hide_index=True)
-        with st.expander("Ver antes / después de un cambio"):
-            if not df_h.empty:
-                rid = st.selectbox("ID del registro", df_h["id"].tolist())
-                fila = df_h[df_h["id"] == rid].iloc[0]
-                c1, c2 = st.columns(2)
-                c1.json(fila["antes"] if fila["antes"] is not None else {})
-                c2.json(fila["despues"] if fila["despues"] is not None else {})
