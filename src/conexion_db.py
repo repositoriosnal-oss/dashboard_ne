@@ -173,7 +173,7 @@ def ejecutar_sincronizacion_desde_sap():
         # ============================================================
         MESES_HISTORICO_VENTAS = 14  # reservado para producción
         FECHA_INICIO_AUDITORIA = "2025-04-01"
-        FECHA_FIN_AUDITORIA = "2026-08-31"
+        FECHA_FIN_AUDITORIA = "2026-12-31"
 
         # ============================================================
         # 🆕 QUERY: VENTAS NETAS (Facturas - Notas Crédito)
@@ -2003,13 +2003,21 @@ def cargar_exentas_por_comercial_ejecom(mes_periodo: str):
 
 
 def guardar_decision_contabilidad(periodo_mes, tipo_registro, nombre_almacen,
-                                   nombre_comercial, documento_comercial,
-                                   valor_sistema, valor_corregido, decision,
-                                   usuario, observacion=""):
-    """Guarda o actualiza una decisión de contabilidad (UPSERT)."""
+                                  nombre_comercial, documento_comercial,
+                                  valor_sistema, valor_corregido, decision,
+                                  usuario, observacion=""):
+    """UPSERT de la decisión + auditoría en la MISMA transacción:
+    si algo falla, no se guarda nada (y si se guarda, queda el rastro)."""
     with _pg_engine_bono().begin() as c:
+        prev = c.execute(text("""
+            SELECT decision, valor_corregido, usuario_decision
+            FROM app.contabilidad_decisiones_exentas
+            WHERE periodo_mes = :pm AND tipo_registro = :tr
+              AND nombre_almacen = :na AND nombre_comercial = :nc
+        """), {"pm": periodo_mes, "tr": tipo_registro,
+               "na": nombre_almacen, "nc": nombre_comercial}).fetchone()
         c.execute(text("""
-            INSERT INTO app.contabilidad_decisiones_exentas 
+            INSERT INTO app.contabilidad_decisiones_exentas
                 (periodo_mes, tipo_registro, nombre_almacen, nombre_comercial,
                  documento_comercial, valor_sistema, valor_corregido, decision,
                  usuario_decision, observacion)
@@ -2021,16 +2029,25 @@ def guardar_decision_contabilidad(periodo_mes, tipo_registro, nombre_almacen,
                 usuario_decision = EXCLUDED.usuario_decision,
                 fecha_decision = now(),
                 observacion = EXCLUDED.observacion
+        """), {"pm": periodo_mes, "tr": tipo_registro, "na": nombre_almacen,
+               "nc": nombre_comercial, "dc": documento_comercial,
+               "vs": valor_sistema, "vc": valor_corregido,
+               "dec": decision, "u": usuario, "obs": observacion})
+        c.execute(text("""
+            INSERT INTO app.bono_auditoria
+                (tabla, accion, usuario, valores_anteriores, valores_nuevos)
+            VALUES ('contabilidad_decisiones_exentas', :acc, :u,
+                    CAST(:va AS jsonb), CAST(:vn AS jsonb))
         """), {
-            "pm": periodo_mes, "tr": tipo_registro, "na": nombre_almacen,
-            "nc": nombre_comercial, "dc": documento_comercial,
-            "vs": valor_sistema, "vc": valor_corregido,
-            "dec": decision, "u": usuario, "obs": observacion,
+            "acc": "UPDATE_DECISION" if prev else "CREATE_DECISION",
+            "u": usuario,
+            "va": _json.dumps({"decision": prev[0], "valor_corregido": prev[1],
+                               "usuario_decision": prev[2]}, default=str) if prev else None,
+            "vn": _json.dumps({"periodo": periodo_mes, "tipo": tipo_registro,
+                               "almacen": nombre_almacen, "comercial": nombre_comercial,
+                               "decision": decision, "valor_corregido": valor_corregido,
+                               "observacion": observacion}, default=str),
         })
-    _auditar_bono("contabilidad_decisiones_exentas", None, f"DECISION_{decision.upper()}",
-                  None, {"periodo": periodo_mes, "almacen": nombre_almacen,
-                         "comercial": nombre_comercial, "decision": decision,
-                         "valor_corregido": valor_corregido})
 
 
 def obtener_decision_contabilidad(periodo_mes, nombre_almacen, nombre_comercial=""):
