@@ -89,8 +89,8 @@ pag_bono_variables = st.Page("views/bono_variables.py", title="Variables del Bon
 pag_contabilidad = st.Page("views/contabilidad_exentas.py", title="Auditoría Exentas", icon=":material/account_balance:")
 pag_rrhh_novedades = st.Page("views/rrhh_novedades.py", title="Novedades RRHH", icon=":material/badge:")
 pag_rrhh_cols = st.Page("views/rrhh_colaboradores.py", title="Colaboradores y Distribución", icon=":material/groups:")
-pag_rrhh_dist = st.Page("views/rrhh_distribucion.py", title="Distribución del Bono", icon=":material/pie_chart:"
-)
+pag_rrhh_dist = st.Page("views/rrhh_distribucion.py", title="Distribución del Bono", icon=":material/pie_chart:")
+pag_inv_descuentos = st.Page("views/inventarios_descuentos.py", title="Descuentos Inventarios", icon=":material/inventory_2:")
 
 # ============================================================
 # 3. MENÚ DINÁMICO POR DEPARTAMENTO Y ROL
@@ -125,6 +125,7 @@ if st.session_state["rol_actual"] in ROLES_BONIFICACIONES:
     paginas_bono = [pag_bono_detalle, pag_bono_conciliacion]
     if st.session_state["rol_actual"] in ROLES_EDIT_BONO:
         paginas_bono.append(pag_bono_variables)
+        paginas_bono.append(pag_rrhh_dist)
     estructura_menu["Bonificaciones"] = paginas_bono
 
 # 🏦 Sección Contabilidad: SOLO admin, gerente y contabilidad
@@ -139,8 +140,9 @@ if st.session_state["rol_actual"] in ROLES_RRHH_CARGUE:
 if st.session_state["rol_actual"] == "admin":
     estructura_menu["Administración"] = [pag_usuarios]
 
-if st.session_state["rol_actual"] in ROLES_RRHH_ADMIN:
-    estructura_menu["Distribución Bono"] = [pag_rrhh_dist]
+ROLES_INVENTARIOS = ["admin", "gerente", "inventarios", "compras"]
+if st.session_state["rol_actual"] in ROLES_INVENTARIOS:
+    estructura_menu["Inventarios"] = [pag_inv_descuentos]
 
 navegacion = st.navigation(estructura_menu)
 
