@@ -86,6 +86,7 @@ pag_rotacion = st.Page("views/rotacion_articulos.py", title="Rotación Artículo
 pag_bono_detalle = st.Page("views/bonificaciones_detalle.py", title="Detalle Bono", icon=":material/redeem:")
 pag_bono_conciliacion = st.Page("views/bonificaciones_conciliacion.py", title="Conciliación Bono", icon=":material/fact_check:")
 pag_bono_variables = st.Page("views/bono_variables.py", title="Variables del Bono", icon=":material/tune:")
+pag_nov_admin = st.Page("views/novedades_admin.py", title="Novedades Administrativas", icon=":material/admin_panel_settings:")
 pag_contabilidad = st.Page("views/contabilidad_exentas.py", title="Auditoría Exentas", icon=":material/account_balance:")
 pag_rrhh_novedades = st.Page("views/rrhh_novedades.py", title="Novedades RRHH", icon=":material/badge:")
 pag_rrhh_cols = st.Page("views/rrhh_colaboradores.py", title="Colaboradores y Distribución", icon=":material/groups:")
@@ -126,6 +127,7 @@ if st.session_state["rol_actual"] in ROLES_BONIFICACIONES:
     if st.session_state["rol_actual"] in ROLES_EDIT_BONO:
         paginas_bono.append(pag_bono_variables)
         paginas_bono.append(pag_rrhh_dist)
+        paginas_bono.append(pag_nov_admin)
     estructura_menu["Bonificaciones"] = paginas_bono
 
 # 🏦 Sección Contabilidad: SOLO admin, gerente y contabilidad

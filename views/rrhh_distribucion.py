@@ -25,7 +25,7 @@ from src.conexion_db import conn
 from src.rrhh import ROLES_RRHH_ADMIN
 
 st.set_page_config(page_title="Distribución del Bono", layout="wide")
-st.title("📊 Distribución del Bono por Almacén")
+st.title("Distribución del Bono por Almacén")
 
 rol = st.session_state.get("rol_actual")
 usuario = st.session_state.get("usuario_actual")
@@ -101,7 +101,7 @@ def mostrar_alertas(alertas):
 
 
 tab_rep, tab_def, tab_evo, tab_ver = st.tabs(
-    ["📋 Reparto del periodo", "✏️ Definir porcentajes", "📈 Evolución", "🧾 Versiones y auditoría"])
+    ["Reparto del periodo", "Definir porcentajes", "Evolución", "Versiones y auditoría"])
 
 # ------------------------------------------------------------
 # 1. REPARTO DEL PERIODO
