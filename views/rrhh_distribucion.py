@@ -1,57 +1,61 @@
 """
-DISTRIBUCIÓN DEL BONO POR ALMACÉN, CARGO, PERSONA Y PERIODO
-
-Solo Gerencia y Administración (Talento Humano NO ve ni edita esta página: aporta los datos de las
-personas; los porcentajes del bono los define Gerencia). Reemplaza la pestaña «Distribución por
-Almacén» de rrhh_colaboradores.py.
-
-Pestañas
-  1. Reparto del periodo : quién estaba en el almacén ese mes, cuánto del bono ocupa cada cargo, qué
-                           porcentaje quedó liberado, cambios del mes y alertas. Sirve para auditar meses pasados.
-  2. Definir porcentajes : plantilla por almacén y versión (mes de vigencia), con acumulado y restante en
-                           vivo; no deja pasar de 100 %.
-  3. Evolución           : cómo cambió la ocupación mes a mes.
-  4. Versiones y auditoría.
-
-La lógica vive en src/rrhh_dist.py (probada en pruebas/test_rrhh_dist.py).
+VISTA: DISTRIBUCIÓN DEL BONO POR ALMACÉN
+Configuración de políticas por período (estilo Variables del Bono) y reparto automático
+del pool por cargo entre los colaboradores registrados por Talento Humano.
 """
-from datetime import date
 
+from __future__ import annotations
+
+import importlib
+from datetime import date
 import pandas as pd
 import streamlit as st
 
 from src import rrhh_dist as dist
+# Forzar recarga en caliente para que cambios en src/rrhh_dist.py surtan efecto sin reiniciar
+try:
+    importlib.reload(dist)
+except Exception:
+    pass
+
 from src.conexion_db import conn
 from src.rrhh import ROLES_RRHH_ADMIN
 
-st.set_page_config(page_title="Distribución del Bono", layout="wide")
+# ============================================================
+# CONFIGURACIÓN Y CONTROL DE ACCESO
+# ============================================================
+st.set_page_config(page_title="Distribución del Bono", page_icon=":material/percent:", layout="wide")
 st.title("Distribución del Bono por Almacén")
 
 rol = st.session_state.get("rol_actual")
-usuario = st.session_state.get("usuario_actual")
+usuario = st.session_state.get("usuario_actual", "admin")
 nombre_usuario = st.session_state.get("nombre_completo", usuario)
+
 if rol not in ROLES_RRHH_ADMIN:
-    st.error("⛔ Acceso denegado. Los porcentajes del bono solo los define y consulta Gerencia o Administración.")
+    st.error("⛔ Acceso denegado. La distribución del bono solo es accesible por Gerencia o Administración.")
     st.stop()
-st.caption(f"Sesión: **{nombre_usuario}** · rol **{rol}**. Cada cambio queda auditado con tu usuario, rol y motivo.")
+
+st.caption(f"Sesión: **{nombre_usuario}** · Rol: **{rol}**. Cada cambio queda auditado en el sistema.")
 
 if "dist_flash" in st.session_state:
     _tipo, _msg = st.session_state.pop("dist_flash")
     getattr(st, _tipo)(_msg)
 
 
+# ============================================================
+# INICIALIZACIÓN / MIGRACIÓN IDEMPOTENTE
+# ============================================================
 @st.cache_resource(show_spinner=False)
-def _migrar():
+def _inicializar_tablas():
     with conn.session as con:
         dist.migrar(con)
         con.commit()
     return True
 
-
 try:
-    _migrar()
+    _inicializar_tablas()
 except Exception as e:  # noqa: BLE001
-    st.error(f"No se pudo preparar la estructura de distribución: {e}")
+    st.error(f"No se pudo inicializar la estructura de distribución: {e}")
     st.stop()
 
 
@@ -60,317 +64,516 @@ def flash(tipo, msg):
     st.rerun()
 
 
+def _transaccion(fn, **kwargs):
+    """Ejecuta fn(con, **kwargs) en una transacción atómica: commit si tiene éxito, rollback si falla."""
+    with conn.session as con:
+        try:
+            resultado = fn(con, **kwargs)
+            con.commit()
+            return resultado
+        except Exception:
+            con.rollback()
+            raise
+
+
 # ============================================================
-# DATOS Y SELECTORES
+# CARGA DE CATÁLOGOS Y SELECTOR PRINCIPAL
 # ============================================================
 ALMACENES = dist.cargar_almacenes(conn)
 if not ALMACENES:
-    st.warning("app.almacenes está vacía.")
+    st.warning("No hay almacenes activos configurados en app.almacenes.")
     st.stop()
-NOM = {a["codigo"]: a["nombre"] for a in ALMACENES}
-MODO = {a["codigo"]: a["modo_bono"] for a in ALMACENES}
 
-PLANT_TODAS = dist.cargar_plantilla(conn)
-ASIG = dist.cargar_asignaciones(conn)
+NOM_ALM = {a["codigo"]: a["nombre"] for a in ALMACENES}
+MODO_ALM = {a["codigo"]: a["modo_bono"] for a in ALMACENES}
 
+# Selector superior de almacén
+c_alm, c_info = st.columns([2, 3])
+almacen_sel = c_alm.selectbox(
+    "Selecciona el Almacén a gestionar",
+    [a["codigo"] for a in ALMACENES],
+    format_func=lambda c: f"{c} — {NOM_ALM.get(c, c)}",
+    key="sb_dist_alm"
+)
+
+modo_bono = MODO_ALM.get(almacen_sel, dist.MODO_PORCENTAJE)
+c_info.caption(
+    f"Almacén: **{NOM_ALM.get(almacen_sel, almacen_sel)}** (`{almacen_sel}`) · "
+    f"Modalidad: **{modo_bono}** "
+    f"({'Bolsa por porcentaje por cargo' if modo_bono == dist.MODO_PORCENTAJE else 'Meta de venta individual'})"
+)
+
+# Carga de datos del almacén y globales
+PERIODOS_TODOS = dist.cargar_periodos(conn)
+PERIODOS_ALM = [p for p in PERIODOS_TODOS if p["almacen"] == almacen_sel]
+CARGOS_CONFIG = dist.cargar_cargos_config(conn)
+ASIGNACIONES = dist.cargar_asignaciones(conn)
+
+# Generación de lista de meses (12 meses atrás hasta 3 meses adelante)
 hoy = date.today()
 mes_actual = dist.inicio_mes(hoy)
-primeros = [a["desde"] for a in ASIG] + [dist.a_fecha(f["vigente_desde"]) for f in PLANT_TODAS]
-mes_ini = dist.inicio_mes(min(primeros + [dist.sumar_meses(mes_actual, -12)]))
-MESES = list(reversed(dist.lista_meses(mes_ini, dist.sumar_meses(mes_actual, 3))))
-
-s1, s2 = st.columns([2, 1])
-almacen = s1.selectbox("Almacén", [a["codigo"] for a in ALMACENES], format_func=lambda c: f"{c} — {NOM[c]}",
-                       key="dist_alm")
-periodo = s2.selectbox("Periodo", MESES, index=MESES.index(mes_actual), format_func=dist.etiqueta_mes,
-                       key="dist_per")
-modo = MODO[almacen]
-plantilla = [f for f in PLANT_TODAS if f["almacen"] == almacen]
-res = dist.calcular_reparto_mes(almacen, periodo, plantilla, ASIG, modo)
+mes_min = dist.sumar_meses(mes_actual, -12)
+mes_max = dist.sumar_meses(mes_actual, 3)
+MESES_OPCIONES = list(reversed(dist.lista_meses(mes_min, mes_max)))
 
 
-def pct(x):
-    return "—" if x is None else f"{x:.2f}%"
-
-
-def mostrar_alertas(alertas):
-    if not alertas:
-        st.success("Sin alertas: el 100 % del bono está ocupado por las personas del periodo.")
-    for a in alertas:
-        {"error": st.error, "warning": st.warning, "info": st.info}[a["nivel"]](a["mensaje"])
-
-
-tab_rep, tab_def, tab_evo, tab_ver = st.tabs(
-    ["Reparto del periodo", "Definir porcentajes", "Evolución", "Versiones y auditoría"])
+# ============================================================
+# PESTAÑAS PRINCIPALES
+# ============================================================
+tab_reparto, tab_config, tab_matriz, tab_auditoria = st.tabs([
+    "📊 Reparto del Periodo",
+    "⚙️ Configurar Períodos y Porcentajes",
+    "🗺️ Matriz General de Almacenes",
+    "📜 Auditoría e Historial"
+])
 
 # ------------------------------------------------------------
-# 1. REPARTO DEL PERIODO
+# 1. PESTAÑA: REPARTO DEL PERIODO (LIQUIDACIÓN Y SIMULACIÓN)
 # ------------------------------------------------------------
-with tab_rep:
-    st.subheader(f"{almacen} — {NOM[almacen]} · {dist.etiqueta_mes(periodo)}")
-    personas = res["personas"]
+with tab_reparto:
+    st.subheader(f"Reparto del Bono · {almacen_sel} — {NOM_ALM.get(almacen_sel, almacen_sel)}")
+    
+    col_per, col_esp = st.columns([1, 2])
+    mes_consultado = col_per.selectbox(
+        "Mes a liquidar / consultar",
+        MESES_OPCIONES,
+        index=MESES_OPCIONES.index(mes_actual),
+        format_func=dist.etiqueta_mes,
+        key="sb_mes_reparto"
+    )
 
-    if modo == dist.MODO_INDIVIDUAL:
-        st.info("**Evaluación individual.** Este almacén no reparte porcentaje del bono: cada ejecutivo cumple "
-                "su meta individual o no recibe bono. Si una persona se traslada a otro almacén, desde ese día "
-                "pasa a las reglas de porcentaje del almacén destino (y viceversa).")
-        st.metric("Personas en el periodo", len(personas))
-    else:
-        t = res["totales"]
-        m1, m2, m3, m4, m5 = st.columns(5)
-        m1.metric("Plantilla asignada", pct(t["asignado"]))
-        m2.metric("Ocupado por personas", pct(t["ocupado"]))
-        m3.metric("Liberado (sin ocupar)", pct(t["libre"]),
-                  delta=f"-{t['libre']:.2f} pts" if t["libre"] > 0.005 else None, delta_color="inverse")
-        m4.metric("En prueba (no participa)", pct(t["prueba"]))
-        m5.metric("Personas en el periodo", len(personas))
-        st.progress(min(max(t["ocupado"] / 100.0, 0.0), 1.0), text=f"Ocupación del 100 % del bono: {t['ocupado']:.2f}%")
-        if res["version"]:
-            st.caption(f"Plantilla aplicada: versión vigente desde **{res['version']}**.")
-    mostrar_alertas(res["alertas"])
+    resultado = dist.calcular_reparto_mes(
+        almacen=almacen_sel,
+        mes=mes_consultado,
+        periodos=PERIODOS_ALM,
+        cargos_config=CARGOS_CONFIG,
+        asignaciones=ASIGNACIONES,
+        modo=modo_bono
+    )
 
-    if modo == dist.MODO_PORCENTAJE and res["cargos"]:
-        st.markdown("##### Plantilla del periodo por cargo")
-        df_c = pd.DataFrame(res["cargos"]).rename(columns={
-            "cargo": "Cargo", "cupos": "Cupos", "pct_persona": "% por persona", "pct_total": "% total del cargo",
-            "personas": "Personas", "ocupacion": "Cupos ocupados", "cupos_libres": "Cupos libres",
-            "pct_libre": "% liberado", "sobrecupo": "Sobrecupo", "pct_exceso": "% en exceso"})
-        st.dataframe(df_c, use_container_width=True, hide_index=True, column_config={
-            "% por persona": st.column_config.NumberColumn(format="%.3f%%"),
-            "% total del cargo": st.column_config.NumberColumn(format="%.3f%%"),
-            "Cupos ocupados": st.column_config.NumberColumn(format="%.2f"),
-            "Cupos libres": st.column_config.NumberColumn(format="%.2f"),
-            "% liberado": st.column_config.NumberColumn(format="%.3f%%"),
-            "Sobrecupo": st.column_config.NumberColumn(format="%.2f"),
-            "% en exceso": st.column_config.NumberColumn(format="%.3f%%")})
+    per_ap = resultado["periodo_aplicado"]
+    if per_ap:
+        f_fin_txt = per_ap['fecha_fin'].strftime('%d/%m/%Y') if per_ap['fecha_fin'] else "Abierto (vigente)"
+        st.info(
+            f"📌 **Política de distribución aplicada:** «{per_ap['nombre']}» "
+            f"· Vigencia: **{per_ap['fecha_inicio'].strftime('%d/%m/%Y')}** hasta **{f_fin_txt}**."
+        )
 
-    st.markdown("##### Personas del periodo")
-    st.caption("Solo quienes estuvieron en el almacén durante el mes (por sus fechas de ingreso, traslado, cambio de "
-               "cargo e inactividad), no la plantilla actual. «Fracción» = días en el almacén ÷ días del mes.")
+    # Mostrar alertas del cálculo
+    if resultado["alertas"]:
+        for al in resultado["alertas"]:
+            if al["nivel"] == "error":
+                st.error(al["mensaje"])
+            elif al["nivel"] == "warning":
+                st.warning(al["mensaje"])
+            else:
+                st.info(al["mensaje"])
+
+    tot = resultado["totales"]
+    m1, m2, m3, m4, m5 = st.columns(5)
+    m1.metric("Bolsa Tienda", f"{tot['asignado_politica']:.2f}%")
+    m2.metric("Repartido a Personas", f"{tot['repartido']:.2f}%")
+    m3.metric("En Prueba (no participa)", f"{tot['en_prueba']:.2f}%")
+    m4.metric("Vacante (cargos libres)", f"{tot['vacante']:.2f}%",
+              delta=f"-{tot['vacante']:.2f}%" if tot['vacante'] > 0 else None, delta_color="inverse")
+    m5.metric("Colaboradores en Mes", tot["personas"])
+
+    st.markdown("---")
+    
+    # 1.1 Resumen por Cargo
+    if modo_bono == dist.MODO_PORCENTAJE and resultado["cargos"]:
+        st.markdown("##### Resumen de Bolsas por Cargo")
+        df_cargos = pd.DataFrame(resultado["cargos"]).rename(columns={
+            "cargo": "Cargo",
+            "pct_bolsa": "% Bolsa Asignada",
+            "personas": "Personas Activas",
+            "dias_totales": "Días-Hombre",
+            "repartido": "% Efectivo Repartido",
+            "en_prueba": "% En Prueba",
+            "vacante": "% Vacante",
+            "estado": "Estado"
+        })
+        st.dataframe(
+            df_cargos,
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "% Bolsa Asignada": st.column_config.NumberColumn(format="%.3f%%"),
+                "% Efectivo Repartido": st.column_config.NumberColumn(format="%.3f%%"),
+                "% En Prueba": st.column_config.NumberColumn(format="%.3f%%"),
+                "% Vacante": st.column_config.NumberColumn(format="%.3f%%"),
+                "Personas Activas": st.column_config.NumberColumn(format="%d"),
+                "Días-Hombre": st.column_config.NumberColumn(format="%d"),
+            }
+        )
+
+    # 1.2 Detalle por Persona
+    st.markdown("##### Detalle Individual de Colaboradores")
+    st.caption("Colaboradores asignados al almacén según Talento Humano durante el mes consultado.")
+    personas = resultado["personas"]
     if not personas:
-        st.info("Nadie estuvo asignado a este almacén en el periodo.")
+        st.info("No hay colaboradores registrados en este almacén durante el mes consultado.")
     else:
-        df_p = pd.DataFrame(personas)[["cedula", "nombre", "cargo", "desde_en_mes", "hasta_en_mes", "dias",
-                                       "dias_prueba", "fraccion", "pct_plantilla", "pct_efectivo", "pct_en_prueba"]]
-        df_p = df_p.rename(columns={
-            "cedula": "Cédula", "nombre": "Nombre", "cargo": "Cargo", "desde_en_mes": "Desde (en el mes)",
-            "hasta_en_mes": "Hasta (en el mes)", "dias": "Días", "dias_prueba": "Días en prueba",
-            "fraccion": "Fracción del mes", "pct_plantilla": "% plantilla", "pct_efectivo": "% que participa",
-            "pct_en_prueba": "% en prueba"})
-        if modo == dist.MODO_INDIVIDUAL:
-            df_p = df_p.drop(columns=["% plantilla", "% que participa", "% en prueba"])
-        st.dataframe(df_p, use_container_width=True, hide_index=True, column_config={
-            "Fracción del mes": st.column_config.NumberColumn(format="%.3f"),
-            "% plantilla": st.column_config.NumberColumn(format="%.3f%%"),
-            "% que participa": st.column_config.NumberColumn(format="%.3f%%"),
-            "% en prueba": st.column_config.NumberColumn(format="%.3f%%")})
-        st.download_button("📥 Descargar personas del periodo (CSV)", df_p.to_csv(index=False).encode("utf-8-sig"),
-                           file_name=f"reparto_{almacen}_{periodo:%Y_%m}.csv", mime="text/csv")
+        df_per = pd.DataFrame(personas)
+        cols_mostrar = ["cedula", "nombre", "cargo", "desde_en_mes", "hasta_en_mes",
+                        "dias", "dias_participa", "dias_prueba"]
+        if modo_bono == dist.MODO_PORCENTAJE:
+            cols_mostrar += ["pct_bolsa_cargo", "pct_efectivo", "pct_en_prueba"]
 
-    st.markdown("##### Cambios del periodo en este almacén")
-    movs = dist.movimientos_mes(almacen, periodo, ASIG)
-    if movs:
-        st.dataframe(pd.DataFrame(movs).rename(columns={"fecha": "Fecha", "tipo": "Movimiento", "nombre": "Nombre",
-                                                        "cedula": "Cédula", "cargo": "Cargo"}),
-                     use_container_width=True, hide_index=True)
-    else:
-        st.caption("Sin ingresos, salidas, traslados ni cambios de cargo en el periodo.")
+        df_display = df_per[cols_mostrar].rename(columns={
+            "cedula": "Cédula",
+            "nombre": "Nombre Colaborador",
+            "cargo": "Cargo",
+            "desde_en_mes": "Desde",
+            "hasta_en_mes": "Hasta",
+            "dias": "Días en Almacén",
+            "dias_participa": "Días Participa",
+            "dias_prueba": "Días Prueba",
+            "pct_bolsa_cargo": "% Bolsa Cargo",
+            "pct_efectivo": "% Bono Asignado",
+            "pct_en_prueba": "% En Prueba"
+        })
+        st.dataframe(
+            df_display,
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "% Bolsa Cargo": st.column_config.NumberColumn(format="%.3f%%"),
+                "% Bono Asignado": st.column_config.NumberColumn(format="%.3f%%"),
+                "% En Prueba": st.column_config.NumberColumn(format="%.3f%%"),
+                "Desde": st.column_config.DateColumn(format="DD/MM/YYYY"),
+                "Hasta": st.column_config.DateColumn(format="DD/MM/YYYY"),
+            }
+        )
+
+        # Botón de descarga
+        csv_data = df_display.to_csv(index=False).encode("utf-8-sig")
+        st.download_button(
+            "📥 Descargar Liquidación del Periodo (CSV)",
+            data=csv_data,
+            file_name=f"liquidacion_bono_{almacen_sel}_{mes_consultado.strftime('%Y_%m')}.csv",
+            mime="text/csv"
+        )
+
 
 # ------------------------------------------------------------
-# 2. DEFINIR PORCENTAJES
+# 2. PESTAÑA: CONFIGURAR PERÍODOS Y PORCENTAJES (ESTILO VARIABLES BONO)
 # ------------------------------------------------------------
-with tab_def:
-    if modo == dist.MODO_INDIVIDUAL:
-        st.info("Este almacén se evalúa por meta individual: no tiene plantilla de porcentajes.")
+with tab_config:
+    if modo_bono == dist.MODO_INDIVIDUAL:
+        st.info(
+            f"El almacén **{almacen_sel}** está configurado en modalidad **INDIVIDUAL** (EJECOM). "
+            "No requiere configuración de bolsa de porcentajes por cargo."
+        )
     else:
-        st.caption("Cada **puesto** = un cargo con sus **cupos** (personas) y el **% del bono por persona**. "
-                   "El total del almacén es Σ (% × cupos) y debe cerrar en 100 %. Ej.: Vendedor 2 con 2 cupos al "
-                   "11 % aporta 22 %. Si alguien sale, su % queda liberado (alerta) hasta que otra persona ocupe el cupo.")
-        versiones = sorted({dist.a_fecha(f["vigente_desde"]) for f in plantilla}, reverse=True)
-        NUEVA = "➕ Nueva versión…"
-        v_rige, _ = dist.version_vigente(plantilla, periodo)
-        opciones = [NUEVA] + versiones
-        idx = opciones.index(v_rige) if v_rige in opciones else 0
-        resumen_v = {v["vigente_desde"]: v for v in dist.versiones(plantilla)}
-        ver_sel = st.selectbox(
-            "Versión de la plantilla a intervenir", opciones, index=idx, key=f"dist_ver_{almacen}",
-            format_func=lambda v: v if v == NUEVA else
-            f"Desde {v} — suma {resumen_v[v]['total']:.3f}% ({resumen_v[v]['estado']})")
+        st.subheader(f"Configuración de Períodos y Porcentajes · {almacen_sel}")
+        st.caption(
+            "Crea y administra los períodos de vigencia para este almacén y define el porcentaje "
+            "asignado a cada cargo. La suma de los cargos debe ser exactamente **100%**."
+        )
 
-        if ver_sel == NUEVA:
-            mes_nv = st.selectbox("Rige desde el mes", MESES, index=MESES.index(mes_actual),
-                                  format_func=dist.etiqueta_mes, key=f"dist_mesnv_{almacen}")
-            vig = mes_nv
-            existe = [f for f in plantilla if dist.inicio_mes(dist.a_fecha(f["vigente_desde"])) == mes_nv]
-            if existe:
-                st.warning(f"Ya existe una versión en {dist.etiqueta_mes(mes_nv)}: selecciónala arriba para editarla.")
-            else:
-                st.info("Una versión nueva reemplaza a la anterior **desde ese mes**; los meses anteriores conservan "
-                        "la plantilla con la que se repartieron.")
-                mot_cp = st.text_input("Motivo de la nueva versión", key=f"dist_motcp_{almacen}")
-                if st.button("📄 Crear copiando la versión anterior", key=f"dist_cp_{almacen}"):
-                    if mes_nv < mes_actual and len(mot_cp.strip()) < 5:
-                        st.error("Estás creando una versión en un mes pasado: indica el motivo (mín. 5 caracteres).")
-                    else:
-                        try:
-                            with conn.session as con:
-                                try:
-                                    n = dist.copiar_version(con, almacen=almacen, mes_destino=mes_nv, usuario=usuario,
-                                                            rol=rol, motivo=mot_cp.strip() or None, nombre=nombre_usuario)
-                                    con.commit()
-                                except Exception:
-                                    con.rollback()
-                                    raise
-                            flash("success", f"✅ Versión de {dist.etiqueta_mes(mes_nv)} creada con {n} puestos copiados.")
-                        except Exception as e:  # noqa: BLE001
-                            st.error(str(e))
-                st.caption("O empieza en blanco agregando el primer puesto abajo.")
-        else:
-            vig = ver_sel
-            if dist.inicio_mes(vig) < mes_actual:
-                st.warning("Esta versión corresponde a un mes pasado: modificarla cambia cómo se ve el reparto "
-                           "histórico. El cambio exige motivo y queda auditado.")
+        NUEVO_PERIODO = "➕ Crear nuevo período para este almacén..."
+        opciones_periodos = [NUEVO_PERIODO] + [
+            f"{p['nombre']} (Desde {p['fecha_inicio'].strftime('%d/%m/%Y')} → "
+            f"{p['fecha_fin'].strftime('%d/%m/%Y') if p['fecha_fin'] else 'Abierto'})"
+            for p in PERIODOS_ALM
+        ]
+        
+        map_periodos = {
+            f"{p['nombre']} (Desde {p['fecha_inicio'].strftime('%d/%m/%Y')} → "
+            f"{p['fecha_fin'].strftime('%d/%m/%Y') if p['fecha_fin'] else 'Abierto'})": p
+            for p in PERIODOS_ALM
+        }
 
-        filas_v = [f for f in plantilla if dist.a_fecha(f["vigente_desde"]) == vig]
-        total_v = dist.total_plantilla(filas_v)
-        k1, k2, k3 = st.columns(3)
-        k1.metric("Acumulado asignado", pct(total_v))
-        k2.metric("Restante por asignar", pct(max(100.0 - total_v, 0.0)))
-        k3.metric("Estado", dist.estado_total(total_v) if filas_v else "SIN PUESTOS")
-        st.progress(min(max(total_v / 100.0, 0.0), 1.0))
-        if filas_v:
-            st.dataframe(pd.DataFrame([{"Cargo": f["cargo"], "Cupos": f["cupos"], "% por persona": f["pct"],
-                                        "% total del cargo": f["pct"] * f["cupos"]} for f in filas_v]),
-                         use_container_width=True, hide_index=True, column_config={
-                "% por persona": st.column_config.NumberColumn(format="%.3f%%"),
-                "% total del cargo": st.column_config.NumberColumn(format="%.3f%%")})
+        sel_per_nombre = st.selectbox(
+            "Selecciona el período a consultar o editar:",
+            opciones_periodos,
+            index=1 if len(opciones_periodos) > 1 else 0,
+            key=f"sb_per_edit_{almacen_sel}"
+        )
 
-        st.markdown("##### Agregar o ajustar un puesto")
-        e1, e2, e3 = st.columns(3)
-        cargo = e1.selectbox("Cargo", dist.CARGOS_BONO, index=None, placeholder="Seleccione…",
-                             key=f"dist_c_{almacen}_{vig}")
-        previo = next((f for f in filas_v if f["cargo"] == cargo), None)
-        k_suf = f"{almacen}_{vig}_{cargo}"
-        cupos = e2.number_input("Cupos (personas en este cargo)", min_value=1, max_value=20, step=1,
-                                value=int(previo["cupos"]) if previo else 1, key=f"dist_k_{k_suf}")
-        pct_p = e3.number_input("% del bono por persona", min_value=0.0, max_value=100.0, step=0.5, format="%.3f",
-                                value=float(previo["pct"]) if previo else 0.0, key=f"dist_p_{k_suf}")
-        puede_guardar = False
-        if cargo and pct_p > 0:
-            cap = dist.capacidad_restante(filas_v, cargo)
-            aporte = pct_p * cupos
-            resultado = cap["otros"] + aporte
-            a1, a2, a3 = st.columns(3)
-            a1.metric("Asignado en otros cargos", pct(cap["otros"]))
-            a2.metric("Restante antes de este puesto", pct(cap["restante"]))
-            a3.metric("Quedaría en", pct(resultado), delta=f"{resultado - 100:+.3f} vs 100%")
-            if resultado > 100.0 + dist.TOL:
-                st.error(f"Bloqueado: este puesto aporta {aporte:.3f}% y solo quedan {cap['restante']:.3f}% por asignar. "
-                         f"Máximo permitido: {cap['restante'] / cupos:.3f}% por persona con {cupos} cupo(s).")
-            else:
-                puede_guardar = True
-                if abs(resultado - 100) <= dist.TOL:
-                    st.success("Con este puesto la plantilla queda completa en 100 %.")
+        es_nuevo = (sel_per_nombre == NUEVO_PERIODO)
+        per_seleccionado = None if es_nuevo else map_periodos[sel_per_nombre]
+
+        # Cargar los cargos actuales para el período seleccionado
+        cargos_actuales = {}
+        if per_seleccionado:
+            pid = per_seleccionado["id"]
+            cargos_actuales = {c["cargo"]: c["pct"] for c in CARGOS_CONFIG if c["periodo_id"] == pid}
+
+        # Formulario de parámetros del período
+        st.markdown("#### Datos del Período")
+        c1, c2, c3 = st.columns([2, 1, 1])
+        
+        val_nombre = "" if es_nuevo else per_seleccionado["nombre"]
+        nombre_in = c1.text_input("Nombre del Período", value=val_nombre,
+                                  placeholder="Ej: Política 2026, Ajuste II Semestre...",
+                                  key=f"inp_nom_per_{almacen_sel}")
+
+        val_fini = date.today() if es_nuevo else per_seleccionado["fecha_inicio"]
+        fecha_ini_in = c2.date_input("Fecha Inicio", value=val_fini, key=f"inp_fini_{almacen_sel}")
+
+        es_abierto = True if es_nuevo else (per_seleccionado["fecha_fin"] is None)
+        chk_abierto = c3.checkbox("Período Abierto (sin fecha fin)", value=es_abierto,
+                                  key=f"chk_abierto_{almacen_sel}")
+
+        fecha_fin_in = None
+        if not chk_abierto:
+            val_ffin = per_seleccionado["fecha_fin"] if (per_seleccionado and per_seleccionado["fecha_fin"]) else date.today()
+            fecha_fin_in = c3.date_input("Fecha Fin", value=val_ffin, key=f"inp_ffin_{almacen_sel}")
+
+        # Acciones Rápidas (Copiar de otro almacén)
+        st.markdown("#### Acciones Rápidas")
+        col_acc1, col_acc2 = st.columns(2)
+        
+        otros_almacenes = [a["codigo"] for a in ALMACENES if a["codigo"] != almacen_sel and a["modo_bono"] == dist.MODO_PORCENTAJE]
+        alm_copiar = col_acc1.selectbox("Copiar estructura desde otro almacén:", ["— Seleccionar —"] + otros_almacenes,
+                                        format_func=lambda c: f"{c} — {NOM_ALM.get(c, c)}" if c != "— Seleccionar —" else c,
+                                        key=f"sb_cp_alm_{almacen_sel}")
+        if col_acc1.button("📋 Cargar cargos de ese almacén", key=f"btn_cp_alm_{almacen_sel}"):
+            if alm_copiar != "— Seleccionar —":
+                pers_otro = [p for p in PERIODOS_TODOS if p["almacen"] == alm_copiar]
+                vig_otro = dist.resolver_periodo(pers_otro, hoy)
+                if vig_otro:
+                    cargos_otro = {c["cargo"]: c["pct"] for c in CARGOS_CONFIG if c["periodo_id"] == vig_otro["id"]}
+                    st.session_state[f"editor_cargos_mem_{almacen_sel}"] = cargos_otro
+                    st.success(f"Cargados los cargos de {alm_copiar} ({vig_otro['nombre']}).")
+                    st.rerun()
                 else:
-                    st.warning(f"Quedarían {100 - resultado:.3f}% por asignar.")
-        exige_motivo = dist.inicio_mes(vig) < mes_actual
-        motivo = st.text_input("Motivo del cambio" + (" (obligatorio: mes pasado)" if exige_motivo else " (opcional)"),
-                               key=f"dist_mot_{almacen}_{vig}")
-        if st.button("💾 Guardar puesto", type="primary", disabled=not puede_guardar, key=f"dist_sv_{almacen}"):
-            if exige_motivo and len(motivo.strip()) < 5:
-                st.error("Indica el motivo del cambio (mín. 5 caracteres).")
+                    st.warning(f"El almacén {alm_copiar} no tiene un período vigente.")
+
+        # Armar DataFrame para el editor interactivo de cargos en tabla
+        cargos_base = list(dist.CARGOS_BONO)
+        mem_cargos = st.session_state.get(f"editor_cargos_mem_{almacen_sel}")
+        fuente_cargos = mem_cargos if mem_cargos is not None else cargos_actuales
+
+        filas_editor = []
+        for c in cargos_base:
+            filas_editor.append({
+                "Cargo": c,
+                "% Asignado": float(fuente_cargos.get(c, 0.0))
+            })
+        for c, p in fuente_cargos.items():
+            if c not in cargos_base:
+                filas_editor.append({"Cargo": c, "% Asignado": float(p)})
+
+        df_editor_in = pd.DataFrame(filas_editor)
+
+        st.markdown("#### Matriz de Porcentajes por Cargo (Edición en Tabla)")
+        st.caption("Edita directamente los porcentajes en la tabla. Los cargos que no apliquen en esta tienda pueden dejarse en 0.0%.")
+
+        df_editado = st.data_editor(
+            df_editor_in,
+            num_rows="dynamic",
+            use_container_width=True,
+            key=f"data_editor_cargos_{almacen_sel}_{sel_per_nombre}",
+            column_config={
+                "Cargo": st.column_config.SelectboxColumn(
+                    "Cargo",
+                    options=dist.CARGOS_BONO,
+                    required=True,
+                    width="medium"
+                ),
+                "% Asignado": st.column_config.NumberColumn(
+                    "% Asignado del Bono",
+                    format="%.3f%%",
+                    min_value=0.0,
+                    max_value=100.0,
+                    step=0.5,
+                    required=True,
+                    width="medium"
+                )
+            }
+        )
+
+        # Cálculo dinámico del total y validación del 100%
+        total_suma = float(df_editado["% Asignado"].sum())
+        dif_100 = round(100.0 - total_suma, 3)
+
+        k1, k2, k3 = st.columns(3)
+        k1.metric("Suma Total de Cargos", f"{total_suma:.3f}%")
+        k2.metric("Diferencia vs 100%", f"{dif_100:+.3f}%")
+
+        puede_guardar = False
+        if abs(dif_100) <= dist.TOL:
+            k3.success("✅ Plantilla equilibrada (100.000%)")
+            puede_guardar = True
+        elif total_suma > 100.0 + dist.TOL:
+            k3.error(f"❌ Excede por {total_suma - 100.0:.3f}% (Máximo 100%)")
+        else:
+            k3.warning(f"⚠️ Faltan {dif_100:.3f}% por asignar")
+            puede_guardar = True
+
+        motivo_cambio = st.text_input(
+            "Motivo o justificación del cambio / creación:",
+            placeholder="Ej: Actualización de política salarial 2026...",
+            key=f"motivo_per_{almacen_sel}"
+        )
+
+        # Botón único para guardar en bloque
+        if st.button("💾 Guardar Configuración del Período", type="primary", disabled=not puede_guardar,
+                     key=f"btn_save_per_{almacen_sel}"):
+            if not nombre_in.strip():
+                st.error("El nombre del período es obligatorio.")
+            elif not fecha_ini_in:
+                st.error("La fecha de inicio es obligatoria.")
+            elif fecha_fin_in and fecha_fin_in < fecha_ini_in:
+                st.error("La fecha de fin no puede ser anterior a la fecha de inicio.")
             else:
                 try:
-                    with conn.session as con:
-                        try:
-                            r = dist.guardar_puesto(con, almacen=almacen, cargo=cargo, pct=pct_p, cupos=cupos,
-                                                    vigente_desde=vig, usuario=usuario, rol=rol,
-                                                    motivo=motivo.strip() or None, nombre=nombre_usuario)
-                            con.commit()
-                        except Exception:
-                            con.rollback()
-                            raise
-                    flash("success", f"✅ {cargo} guardado. La versión suma {r['total']:.3f}% "
-                                     f"(restante {max(r['restante'], 0):.3f}%).")
-                except Exception as e:  # noqa: BLE001
-                    st.error(str(e))
+                    cargos_dict = {
+                        str(r["Cargo"]).strip(): float(r["% Asignado"])
+                        for _, r in df_editado.iterrows()
+                        if pd.notna(r["Cargo"]) and float(r.get("% Asignado", 0)) > 0
+                    }
+                    _transaccion(
+                        dist.guardar_periodo_con_cargos,
+                        almacen=almacen_sel,
+                        periodo_id=per_seleccionado["id"] if per_seleccionado else None,
+                        nombre=nombre_in.strip(),
+                        fecha_inicio=fecha_ini_in,
+                        fecha_fin=fecha_fin_in,
+                        cargos_pct=cargos_dict,
+                        usuario=usuario,
+                        rol=rol,
+                        motivo=motivo_cambio.strip() or None,
+                        nombre_usuario=nombre_usuario
+                    )
+                    st.session_state.pop(f"editor_cargos_mem_{almacen_sel}", None)
+                    flash("success", f"✅ Período «{nombre_in.strip()}» guardado exitosamente con {len(cargos_dict)} cargos.")
+                except Exception as ex:  # noqa: BLE001
+                    st.error(f"Error al guardar: {ex}")
 
-        if filas_v:
-            with st.expander("Eliminar un puesto de esta versión"):
-                ops = {f"{f['cargo']} · {f['cupos']} cupo(s) · {f['pct']:.3f}% c/u": f["id"] for f in filas_v}
-                sel_del = st.selectbox("Puesto", list(ops), key=f"dist_del_{almacen}_{vig}")
-                mot_del = st.text_input("Motivo (obligatorio)", key=f"dist_motdel_{almacen}_{vig}")
-                ok_del = st.checkbox("Confirmo que elimino este puesto.", key=f"dist_okdel_{almacen}_{vig}")
-                if st.button("Eliminar puesto", disabled=not ok_del, key=f"dist_btndel_{almacen}_{vig}"):
-                    if len(mot_del.strip()) < 5:
-                        st.error("Indica el motivo (mín. 5 caracteres).")
+        # Expander para eliminar período
+        if per_seleccionado:
+            st.markdown("---")
+            with st.expander("⚠️ Opciones Avanzadas: Eliminar Período"):
+                st.warning(
+                    f"Al eliminar el período «{per_seleccionado['nombre']}», se eliminarán sus porcentajes asociados. "
+                    "Esta acción quedará registrada en la auditoría del sistema."
+                )
+                motivo_del = st.text_input("Motivo de la eliminación (obligatorio):", key=f"mot_del_{almacen_sel}")
+                chk_del = st.checkbox("Confirmo que deseo eliminar este período", key=f"chk_del_{almacen_sel}")
+                if st.button("🗑️ Eliminar Período Definitivamente", type="secondary", disabled=not chk_del,
+                             key=f"btn_del_per_{almacen_sel}"):
+                    if len(motivo_del.strip()) < 5:
+                        st.error("Debes indicar un motivo de al menos 5 caracteres.")
                     else:
                         try:
-                            with conn.session as con:
-                                try:
-                                    dist.eliminar_puesto(con, puesto_id=ops[sel_del], usuario=usuario, rol=rol,
-                                                         motivo=mot_del.strip(), nombre=nombre_usuario)
-                                    con.commit()
-                                except Exception:
-                                    con.rollback()
-                                    raise
-                            flash("success", "✅ Puesto eliminado.")
-                        except Exception as e:  # noqa: BLE001
-                            st.error(str(e))
+                            _transaccion(
+                                dist.eliminar_periodo,
+                                periodo_id=per_seleccionado["id"],
+                                almacen=almacen_sel,
+                                usuario=usuario,
+                                rol=rol,
+                                motivo=motivo_del.strip()
+                            )
+                            flash("success", f"✅ Período «{per_seleccionado['nombre']}» eliminado.")
+                        except Exception as ex:  # noqa: BLE001
+                            st.error(f"Error al eliminar: {ex}")
+
 
 # ------------------------------------------------------------
-# 3. EVOLUCIÓN
+# 3. PESTAÑA: MATRIZ GENERAL DE TODA LA RED DE ALMACENES
 # ------------------------------------------------------------
-with tab_evo:
-    n_meses = st.select_slider("Meses a mostrar (terminando en el periodo elegido)", options=[3, 6, 12, 24], value=12)
-    meses_ev = dist.lista_meses(dist.sumar_meses(periodo, -(n_meses - 1)), periodo)
-    df_e = pd.DataFrame(dist.evolucion(almacen, meses_ev, plantilla, ASIG, modo))
-    if modo == dist.MODO_INDIVIDUAL:
-        st.dataframe(df_e[["mes", "personas"]].rename(columns={"mes": "Mes", "personas": "Personas"}),
-                     use_container_width=True, hide_index=True)
-    else:
-        mostrar = df_e.rename(columns={"mes": "Mes", "personas": "Personas", "asignado": "Plantilla %",
-                                       "ocupado": "Ocupado %", "libre": "Liberado %", "pagado": "Participa %",
-                                       "en_prueba": "En prueba %", "alertas": "Alertas", "version": "Versión"})
-        st.dataframe(mostrar, use_container_width=True, hide_index=True, column_config={
-            c: st.column_config.NumberColumn(format="%.2f%%") for c in
-            ("Plantilla %", "Ocupado %", "Liberado %", "Participa %", "En prueba %")})
-        graf = df_e.set_index("mes")[["asignado", "ocupado", "libre"]].rename(
-            columns={"asignado": "Plantilla", "ocupado": "Ocupado", "libre": "Liberado"})
-        st.line_chart(graf)
-        st.caption("Meses con «Liberado» > 0 tuvieron cupos sin ocupar (porcentaje sin repartir).")
+with tab_matriz:
+    st.subheader("Matriz General de la Red Comercial")
+    st.caption("Visión panorámica de la política de distribución vigente en cada almacén.")
+
+    matriz_filas = []
+    cargos_col = ["Gerente Punto", "Vendedor 1", "Vendedor 2", "Vendedor 3", "Cajera", "Bodega 1", "Bodega 2", "Conductor"]
+
+    for alm in ALMACENES:
+        cod = alm["codigo"]
+        nom = alm["nombre"]
+        modo = alm["modo_bono"]
+
+        if modo == dist.MODO_INDIVIDUAL:
+            fila = {
+                "Almacén": cod, "Nombre": nom, "Modalidad": "INDIVIDUAL",
+                "Período Vigente": "Meta Individual", "Total %": "—", "Estado": "Individual"
+            }
+            for c in cargos_col:
+                fila[c] = "—"
+            matriz_filas.append(fila)
+            continue
+
+        pers_alm = [p for p in PERIODOS_TODOS if p["almacen"] == cod]
+        vig = dist.resolver_periodo(pers_alm, hoy)
+
+        if not vig:
+            fila = {
+                "Almacén": cod, "Nombre": nom, "Modalidad": "PORCENTAJE",
+                "Período Vigente": "❌ Sin período", "Total %": "0.000%", "Estado": "Sin configurar"
+            }
+            for c in cargos_col:
+                fila[c] = "0.000%"
+            matriz_filas.append(fila)
+            continue
+
+        cargos_vig = {c["cargo"]: c["pct"] for c in CARGOS_CONFIG if c["periodo_id"] == vig["id"]}
+        tot_alm = sum(cargos_vig.values())
+        estado_txt = "✅ 100%" if abs(tot_alm - 100.0) <= dist.TOL else f"⚠️ {tot_alm:.1f}%"
+
+        fila = {
+            "Almacén": cod,
+            "Nombre": nom,
+            "Modalidad": "PORCENTAJE",
+            "Período Vigente": vig["nombre"],
+            "Total %": f"{tot_alm:.3f}%",
+            "Estado": estado_txt
+        }
+        for c in cargos_col:
+            val_c = cargos_vig.get(c, 0.0)
+            fila[c] = f"{val_c:.2f}%" if val_c > 0 else "—"
+
+        matriz_filas.append(fila)
+
+    df_matriz = pd.DataFrame(matriz_filas)
+    st.dataframe(df_matriz, use_container_width=True, hide_index=True)
+
+    csv_matriz = df_matriz.to_csv(index=False).encode("utf-8-sig")
+    st.download_button(
+        "📥 Descargar Matriz General (CSV)",
+        data=csv_matriz,
+        file_name="matriz_general_distribucion_almacenes.csv",
+        mime="text/csv"
+    )
+
 
 # ------------------------------------------------------------
-# 4. VERSIONES Y AUDITORÍA
+# 4. PESTAÑA: HISTORIAL Y AUDITORÍA
 # ------------------------------------------------------------
-with tab_ver:
-    st.markdown("##### Versiones de la plantilla")
-    vs = dist.versiones(plantilla)
-    if vs:
-        st.dataframe(pd.DataFrame(vs).rename(columns={"vigente_desde": "Rige desde", "puestos": "Puestos",
-                                                      "total": "Suma %", "estado": "Estado"}),
-                     use_container_width=True, hide_index=True)
-    else:
-        st.info("Este almacén aún no tiene versiones de plantilla.")
-    st.markdown("##### Auditoría de cambios de este almacén")
-    aud = conn.query("""
-        SELECT fecha, usuario, COALESCE(nombre_usuario, usuario) AS nombre, rol, accion, registro_id, antes, despues
+with tab_auditoria:
+    st.subheader(f"Auditoría de Cambios · {almacen_sel}")
+    st.caption("Registro inmutable de creación, edición y eliminación de períodos y cargos.")
+
+    df_aud = conn.query("""
+        SELECT fecha, usuario, COALESCE(nombre_usuario, usuario) AS nombre, rol,
+               accion, registro_id, despues
         FROM rrhh.rrhh_auditoria
-        WHERE tabla = 'distribucion_puestos' AND (registro_id = :a OR registro_id LIKE :p)
-        ORDER BY fecha DESC LIMIT 200
-    """, params={"a": almacen, "p": f"{almacen}:%"}, ttl=0)
-    if aud.empty:
-        st.info("Sin cambios auditados para este almacén.")
+        WHERE tabla IN ('distribucion_periodos', 'distribucion_puestos')
+          AND (registro_id LIKE :p OR registro_id = :a)
+        ORDER BY fecha DESC LIMIT 100
+    """, params={"p": f"{almacen_sel}:%", "a": almacen_sel}, ttl=0)
+
+    if df_aud.empty:
+        st.info("No hay registros de auditoría para este almacén.")
     else:
-        st.dataframe(aud[["fecha", "nombre", "usuario", "rol", "accion", "registro_id"]].rename(columns={
-            "fecha": "Fecha", "nombre": "Nombre", "usuario": "Usuario", "rol": "Rol", "accion": "Acción",
-            "registro_id": "Registro"}), use_container_width=True, hide_index=True)
-        with st.expander("Ver antes / después y motivo"):
-            idx_a = st.selectbox("Fila", list(range(len(aud))),
-                                 format_func=lambda i: f"{aud.iloc[i]['fecha']} · {aud.iloc[i]['accion']}")
-            f = aud.iloc[idx_a]
-            c1, c2 = st.columns(2)
-            c1.markdown("**Antes**")
-            c1.json(f["antes"] if f["antes"] is not None else {})
-            c2.markdown("**Después (incluye motivo)**")
-            c2.json(f["despues"] if f["despues"] is not None else {})
+        st.dataframe(
+            df_aud[["fecha", "nombre", "usuario", "rol", "accion", "registro_id"]].rename(columns={
+                "fecha": "Fecha", "nombre": "Nombre", "usuario": "Usuario",
+                "rol": "Rol", "accion": "Acción", "registro_id": "Registro"
+            }),
+            use_container_width=True,
+            hide_index=True
+        )
+
+        with st.expander("🔍 Ver Detalles y Motivo de un Cambio"):
+            sel_idx = st.selectbox(
+                "Selecciona el registro a inspeccionar:",
+                list(range(len(df_aud))),
+                format_func=lambda i: f"{df_aud.iloc[i]['fecha']} · {df_aud.iloc[i]['accion']} · {df_aud.iloc[i]['nombre']}"
+            )
+            reg = df_aud.iloc[sel_idx]
+            st.json(reg["despues"] if reg["despues"] is not None else {})
