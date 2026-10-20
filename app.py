@@ -85,6 +85,7 @@ pag_rotacion = st.Page("views/rotacion_articulos.py", title="Rotación Artículo
 # 🎁 Módulo Bonificaciones
 pag_bono_detalle = st.Page("views/bonificaciones_detalle.py", title="Detalle Bono", icon=":material/redeem:")
 pag_bono_conciliacion = st.Page("views/bonificaciones_conciliacion.py", title="Conciliación Bono", icon=":material/fact_check:")
+pag_bono_reparticion = st.Page("views/bono_reparticion.py", title="Repartición del Bono", icon=":material/payments:")
 pag_bono_variables = st.Page("views/bono_variables.py", title="Variables del Bono", icon=":material/tune:")
 pag_nov_admin = st.Page("views/novedades_admin.py", title="Novedades Administrativas", icon=":material/admin_panel_settings:")
 pag_contabilidad = st.Page("views/contabilidad_exentas.py", title="Auditoría Exentas", icon=":material/account_balance:")
@@ -123,7 +124,7 @@ if st.session_state["rol_actual"] in ROLES_CON_ACCESO_COMPRAS:
 ROLES_BONIFICACIONES = ["admin", "gerente", "gerente_comercial"]
 ROLES_EDIT_BONO = ["admin", "gerente"]
 if st.session_state["rol_actual"] in ROLES_BONIFICACIONES:
-    paginas_bono = [pag_bono_detalle, pag_bono_conciliacion]
+    paginas_bono = [pag_bono_detalle, pag_bono_conciliacion, pag_bono_reparticion]
     if st.session_state["rol_actual"] in ROLES_EDIT_BONO:
         paginas_bono.append(pag_bono_variables)
         paginas_bono.append(pag_rrhh_dist)

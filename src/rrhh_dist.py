@@ -133,6 +133,9 @@ def lista_meses(desde: date, hasta: date) -> list[date]:
         cur = sumar_meses(cur, 1)
     return res
 
+# Alias para compatibilidad hacia atrás
+generar_rango_meses = lista_meses
+
 
 def etiqueta_mes(d: date) -> str:
     nombres = ["Ene", "Feb", "Mar", "Abr", "May", "Jun", "Jul", "Ago", "Sep", "Oct", "Nov", "Dic"]
@@ -190,7 +193,6 @@ def fin_efectivo(a: dict) -> date | None:
 # =====================================================================
 
 def calcular_reparto_mes(
-    *,
     almacen: str,
     mes: date,
     periodos: list[dict],
