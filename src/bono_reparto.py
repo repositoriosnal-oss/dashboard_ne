@@ -120,7 +120,7 @@ def consolidar_reparticion_almacen(
 
     for p in personas:
         cid = p["colaborador_id"]
-        pct_efectivo = float(p.get("pct_efectivo", 0.0))
+        pct_efectivo = float(p.get("pct_efectivo") or 0.0)
         pct_bolsa_cargo = float(p.get("pct_bolsa_cargo", 0.0))
         cargo = p.get("cargo", "Sin cargo")
         nombre = p.get("nombre", "")

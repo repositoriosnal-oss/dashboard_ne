@@ -291,9 +291,10 @@ for alm in ALMACENES_DB:
     cod_alm = alm["codigo"]
     nom_alm = alm["nombre"]
     modo = alm.get("modo_bono", dist.MODO_PORCENTAJE)
-    datos_liq = MAP_LIQ_ALM.get(nom_alm, {
+    datos_liq = MAP_LIQ_ALM.get(nom_alm) or MAP_LIQ_ALM.get(cod_alm) or {
         "pvp": 0.0, "aplica": False, "valor_bono": 0.0, "bono_final": 0.0
-    })
+    }
+
 
     # Si es individual (EJECOM), no usa bolsa
     if modo == dist.MODO_INDIVIDUAL:
