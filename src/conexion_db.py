@@ -630,6 +630,34 @@ METAS_2026 = [
     (2_580_000_000, True, None, False, 1.00),
 ]
 
+META_EJECUTIVO_MENSUAL = 430_000_000
+METAS_EJECOM_DEFAULT = [
+    (0, True, META_EJECUTIVO_MENSUAL, False, 0.00),
+    (META_EJECUTIVO_MENSUAL, True, None, False, 1.00),
+]
+AMBITOS_BONO = ("ALMACEN", "EJECOM")
+
+
+def _ts(v):
+    """date | datetime | Timestamp | str | None -> pd.Timestamp (NaT si None/NaT).
+    Evita el error 'Cannot compare Timestamp with datetime.date'."""
+    if v is None:
+        return pd.NaT
+    try:
+        if pd.isna(v):
+            return pd.NaT
+    except (TypeError, ValueError):
+        pass
+    return pd.Timestamp(v)
+
+def _mask_vigencia(df, fecha) -> pd.Series:
+    """Máscara de filas cuyo [fecha_inicio, fecha_fin] cubre `fecha` (fin NaT = abierto).
+    Normaliza dtypes: soporta columnas DATE que llegan como datetime.date (object)
+    o como datetime64, y evita 'Cannot compare Timestamp with datetime.date'."""
+    ts = pd.Timestamp(fecha)
+    ini = pd.to_datetime(df["fecha_inicio"], errors="coerce")
+    fin = pd.to_datetime(df["fecha_fin"], errors="coerce")
+    return (ini <= ts) & (fin.isna() | (fin >= ts))
 
 # ============================================================
 #  FUNCIÓN: CARGA Y TRANSFORMACIÓN DE VENTAS NETAS
@@ -1482,6 +1510,10 @@ def bootstrap_bono_variables():
                 actualizado_por TEXT, actualizado_en TIMESTAMPTZ
             );
         """))
+        c.execute(text("""
+            ALTER TABLE app.bono_periodos_metas ADD COLUMN IF NOT EXISTS ambito TEXT NOT NULL DEFAULT 'ALMACEN';
+            ALTER TABLE app.bono_periodos_escala ADD COLUMN IF NOT EXISTS ambito TEXT NOT NULL DEFAULT 'ALMACEN';
+        """))
 
     # ---------- FASE 2: SEMILLA (tablas ya confirmadas y visibles) ----------
     creados = []
@@ -1512,6 +1544,33 @@ def bootstrap_bono_variables():
                     """), {"p": pid, "o": i, "cmn": cmn, "cmi": cmi, "cmx": cmx, "cxi": cxi, "pb": pb})
                 creados.append((pid, {"nombre": nom, "fecha_inicio": fi, "fecha_fin": ff}))
 
+        n_ej = c.execute(text("SELECT COUNT(*) FROM app.bono_periodos_metas WHERE ambito = 'EJECOM'")).scalar()
+        if not n_ej:
+            for (nom, fi, ff) in (("EJECOM 2025", "2025-01-01", "2025-12-31"), ("EJECOM 2026→", "2026-01-01", None)):
+                pid = c.execute(text("""
+                    INSERT INTO app.bono_periodos_metas (nombre, fecha_inicio, fecha_fin, ambito, creado_por)
+                    VALUES (:n, CAST(:fi AS date), CAST(:ff AS date), 'EJECOM', :u) RETURNING id
+                """), {"n": nom, "fi": fi, "ff": ff, "u": "bootstrap"}).scalar()
+                for i, (mn, mi, mx, mxi, p) in enumerate(METAS_EJECOM_DEFAULT, 1):
+                    c.execute(text("""
+                        INSERT INTO app.bono_metas_ventas
+                            (periodo_id, orden, umbral_min, min_inclusivo, umbral_max, max_inclusivo, pct_aplica)
+                        VALUES (:p, :o, :mn, :mi, :mx, :mxi, :pct)
+                    """), {"p": pid, "o": i, "mn": mn, "mi": mi, "mx": mx, "mxi": mxi, "pct": p})
+        n_eje = c.execute(text("SELECT COUNT(*) FROM app.bono_periodos_escala WHERE ambito = 'EJECOM'")).scalar()
+        if not n_eje:
+            for (nom, fi, ff) in (("EJECOM 2025", "2025-01-01", "2025-12-31"), ("EJECOM 2026→", "2026-01-01", None)):
+                pid = c.execute(text("""
+                    INSERT INTO app.bono_periodos_escala (nombre, fecha_inicio, fecha_fin, ambito, creado_por)
+                    VALUES (:n, CAST(:fi AS date), CAST(:ff AS date), 'EJECOM', :u) RETURNING id
+                """), {"n": nom, "fi": fi, "ff": ff, "u": "bootstrap"}).scalar()
+                for i, (cmn, cmi, cmx, cxi, pb) in enumerate(ESCALA_RENT_DEFAULT, 1):
+                    c.execute(text("""
+                        INSERT INTO app.bono_escala_rentabilidad
+                            (periodo_id, orden, cond_min, min_inclusivo, cond_max, max_inclusivo, pct_bono)
+                        VALUES (:p, :o, :cmn, :cmi, :cmx, :cxi, :pb)
+                    """), {"p": pid, "o": i, "cmn": cmn, "cmi": cmi, "cmx": cmx, "cxi": cxi, "pb": pb})
+
     # ---------- FASE 3: AUDITORÍA post-commit (best-effort, no rompe la semilla) ----------
     for pid, payload in creados:
         try:
@@ -1537,17 +1596,19 @@ def _cargar_periodos_escala():
     return conn.query("SELECT * FROM app.bono_periodos_escala WHERE activo ORDER BY fecha_inicio")
 
 
-def resolver_periodo_metas(fecha):
-    """Retorna (fila_período_metas, df_tramos) vigentes para la fecha."""
+def resolver_periodo_metas(fecha, ambito="ALMACEN"):
+    """Retorna (fila_período_metas, df_tramos) vigentes para la fecha en el ámbito dado."""
     if isinstance(fecha, str):
         fecha = pd.Timestamp(fecha if len(fecha) == 10 else fecha + "-01").date()
     elif isinstance(fecha, pd.Timestamp):
         fecha = fecha.date()
     per_m = _cargar_periodos_metas()
+    if "ambito" in per_m.columns:
+        per_m = per_m[per_m["ambito"] == ambito]
     met = conn.query("SELECT * FROM app.bono_metas_ventas ORDER BY periodo_id, orden")
     if per_m.empty:
         return None, None
-    mask = (per_m["fecha_inicio"] <= fecha) & (per_m["fecha_fin"].isna() | (per_m["fecha_fin"] >= fecha))
+    mask = _mask_vigencia(per_m, fecha)
     sel = per_m[mask]
     if sel.empty:
         return None, None
@@ -1555,17 +1616,19 @@ def resolver_periodo_metas(fecha):
     return row, met[met["periodo_id"] == int(row["id"])]
 
 
-def resolver_periodo_escala(fecha):
-    """Retorna (fila_período_escala, df_rangos) vigentes para la fecha."""
+def resolver_periodo_escala(fecha, ambito="ALMACEN"):
+    """Retorna (fila_período_escala, df_rangos) vigentes para la fecha en el ámbito dado."""
     if isinstance(fecha, str):
         fecha = pd.Timestamp(fecha if len(fecha) == 10 else fecha + "-01").date()
     elif isinstance(fecha, pd.Timestamp):
         fecha = fecha.date()
     per_e = _cargar_periodos_escala()
+    if "ambito" in per_e.columns:
+        per_e = per_e[per_e["ambito"] == ambito]
     esc = conn.query("SELECT * FROM app.bono_escala_rentabilidad ORDER BY periodo_id, orden")
     if per_e.empty:
         return None, None
-    mask = (per_e["fecha_inicio"] <= fecha) & (per_e["fecha_fin"].isna() | (per_e["fecha_fin"] >= fecha))
+    mask = _mask_vigencia(per_e, fecha)
     sel = per_e[mask]
     if sel.empty:
         return None, None
@@ -1599,58 +1662,60 @@ def crear_periodo_escala(nombre, f_ini, f_fin, usuario):
 # ============================================================
 # CRUD ADICIONAL: actualizar y eliminar períodos de metas y escala
 # ============================================================
-def _validar_sin_solape_tabla(tabla, f_ini, f_fin, excluir_id=None):
-    """Verifica que no haya solapamiento de fechas en una tabla de períodos."""
+def _validar_sin_solape_tabla(tabla, f_ini, f_fin, excluir_id=None, ambito=None):
     per = conn.query(f"SELECT * FROM {tabla} WHERE activo")
-    ini = pd.Timestamp(f_ini)
-    fin = pd.Timestamp(f_fin) if f_fin else pd.Timestamp("2262-01-01")
+    if ambito is not None and "ambito" in per.columns:
+        per = per[per["ambito"] == ambito]
+    ini = _ts(f_ini)
+    fin = _ts(f_fin) if f_fin is not None else pd.Timestamp("2262-01-01")
+    if ini is pd.NaT:
+        return
     for _, r in per.iterrows():
         if excluir_id is not None and int(r["id"]) == int(excluir_id):
             continue
-        r_fin = r["fecha_fin"] if pd.notna(r["fecha_fin"]) else pd.Timestamp("2262-01-01")
-        if ini <= r_fin and r["fecha_inicio"] <= fin:
+        r_ini = _ts(r["fecha_inicio"])
+        r_fin = _ts(r["fecha_fin"]) if pd.notna(r["fecha_fin"]) else pd.Timestamp("2262-01-01")
+        if ini <= r_fin and r_ini <= fin:
             raise ValueError(f"Se solapa con el período '{r['nombre']}'")
 
 
 def actualizar_periodo_metas(pid, campos, usuario):
-    """Actualiza nombre y fechas de un período de tramos de meta."""
     campos = {k: v for k, v in campos.items() if k in {"nombre", "fecha_inicio", "fecha_fin", "activo"}}
     per = _cargar_periodos_metas()
     antes = per[per["id"] == pid]
     if antes.empty:
         raise ValueError("Período de tramos no encontrado")
     antes_dict = antes.iloc[0].to_dict()
+    ambito = antes_dict.get("ambito", "ALMACEN") if "ambito" in antes_dict else "ALMACEN"
     f_ini = campos.get("fecha_inicio", antes_dict["fecha_inicio"])
     f_fin = campos.get("fecha_fin", antes_dict["fecha_fin"])
-    _validar_sin_solape_tabla("app.bono_periodos_metas", f_ini, f_fin, excluir_id=pid)
+    _validar_sin_solape_tabla("app.bono_periodos_metas", f_ini, f_fin, excluir_id=pid, ambito=ambito)
     sets = ", ".join([f"{k} = :{k}" for k in campos])
-    params = dict(campos)
-    params["pid"] = pid
-    params["u"] = usuario
+    params = dict(campos); params["pid"] = pid; params["u"] = usuario
     with _pg_engine_bono().begin() as c:
-        c.execute(text(f"UPDATE app.bono_periodos_metas SET {sets}, actualizado_por = :u, actualizado_en = now() WHERE id = :pid"), params)
+        c.execute(text(f"UPDATE app.bono_periodos_metas SET {sets}, actualizado_por = :u, "
+                       f"actualizado_en = now() WHERE id = :pid"), params)
     _auditar_bono("bono_periodos_metas", pid, "UPDATE", antes_dict, campos)
     _cargar_periodos_metas.clear()
     pct_bono_por_mes_almacen.clear()
 
 
 def actualizar_periodo_escala(pid, campos, usuario):
-    """Actualiza nombre y fechas de un período de escala de rentabilidad."""
     campos = {k: v for k, v in campos.items() if k in {"nombre", "fecha_inicio", "fecha_fin", "activo"}}
     per = _cargar_periodos_escala()
     antes = per[per["id"] == pid]
     if antes.empty:
         raise ValueError("Período de escala no encontrado")
     antes_dict = antes.iloc[0].to_dict()
+    ambito = antes_dict.get("ambito", "ALMACEN") if "ambito" in antes_dict else "ALMACEN"
     f_ini = campos.get("fecha_inicio", antes_dict["fecha_inicio"])
     f_fin = campos.get("fecha_fin", antes_dict["fecha_fin"])
-    _validar_sin_solape_tabla("app.bono_periodos_escala", f_ini, f_fin, excluir_id=pid)
+    _validar_sin_solape_tabla("app.bono_periodos_escala", f_ini, f_fin, excluir_id=pid, ambito=ambito)
     sets = ", ".join([f"{k} = :{k}" for k in campos])
-    params = dict(campos)
-    params["pid"] = pid
-    params["u"] = usuario
+    params = dict(campos); params["pid"] = pid; params["u"] = usuario
     with _pg_engine_bono().begin() as c:
-        c.execute(text(f"UPDATE app.bono_periodos_escala SET {sets}, actualizado_por = :u, actualizado_en = now() WHERE id = :pid"), params)
+        c.execute(text(f"UPDATE app.bono_periodos_escala SET {sets}, actualizado_por = :u, "
+                       f"actualizado_en = now() WHERE id = :pid"), params)
     _auditar_bono("bono_periodos_escala", pid, "UPDATE", antes_dict, campos)
     _cargar_periodos_escala.clear()
 
@@ -1779,13 +1844,14 @@ def pct_bono_por_mes_almacen():
     df = df.groupby(["anio", "mes", "nombre_almacen"], as_index=False)["ventas_mes"].sum()
 
     per_m = _cargar_periodos_metas()
+    if "ambito" in per_m.columns:
+        per_m = per_m[per_m["ambito"] == "ALMACEN"]
     met = conn.query("SELECT * FROM app.bono_metas_ventas ORDER BY periodo_id, orden")
 
     resultados = []
     for (anio, mes), grp in df.groupby(["anio", "mes"]):
         fecha = pd.Timestamp(year=int(anio), month=int(mes), day=1).date()
-        sel = per_m[(per_m["fecha_inicio"] <= fecha) &
-                    (per_m["fecha_fin"].isna() | (per_m["fecha_fin"] >= fecha))]
+        sel = per_m[_mask_vigencia(per_m, fecha)]
         grp = grp.copy()
         if sel.empty:
             grp["pct_bono"] = 0.0
@@ -1823,9 +1889,7 @@ def resolver_periodo_bono(fecha):
     per, met, esc = _cargar_config_bono()
     if per.empty:
         return None, None, None
-    mask = (per["fecha_inicio"] <= fecha) & (
-        per["fecha_fin"].isna() | (per["fecha_fin"] >= fecha)
-    )
+    mask = _mask_vigencia(per, fecha)
     sel = per[mask]
     if sel.empty:
         return None, None, None
@@ -1855,22 +1919,25 @@ def aplicar_escala_rentabilidad(rent_ratio, esc_df):
     return float(r["pct_bono"]) if r is not None else -1.0
 
 
-# ---------------- CRUD auditado ----------------
 def _validar_sin_solape(f_ini, f_fin, excluir_id=None):
     per, _, _ = _cargar_config_bono()
-    ini = pd.Timestamp(f_ini)
-    fin = pd.Timestamp(f_fin) if f_fin else pd.Timestamp("2262-01-01")
+    ini = _ts(f_ini)
+    fin = _ts(f_fin) if f_fin is not None else pd.Timestamp("2262-01-01")
+    if ini is pd.NaT:
+        return
     for _, r in per.iterrows():
         if excluir_id is not None and int(r["id"]) == int(excluir_id):
             continue
-        r_fin = r["fecha_fin"] if pd.notna(r["fecha_fin"]) else pd.Timestamp("2262-01-01")
-        if ini <= r_fin and r["fecha_inicio"] <= fin:
+        r_ini = _ts(r["fecha_inicio"])
+        r_fin = _ts(r["fecha_fin"]) if pd.notna(r["fecha_fin"]) else pd.Timestamp("2262-01-01")
+        if ini <= r_fin and r_ini <= fin:
             raise ValueError(f"Se solapa con el período '{r['nombre']}'")
 
 
 CAMPOS_PERIODO_PERMITIDOS = {
     "nombre", "fecha_inicio", "fecha_fin", "factor_desc_exentas",
     "meta_adic_base", "meta_adic_bloque", "meta_adic_pct", "activo",
+    "meta_ejecutivo_mensual",
 }
 
 
