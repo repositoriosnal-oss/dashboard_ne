@@ -1514,7 +1514,12 @@ def bootstrap_bono_variables():
             ALTER TABLE app.bono_periodos_metas ADD COLUMN IF NOT EXISTS ambito TEXT NOT NULL DEFAULT 'ALMACEN';
             ALTER TABLE app.bono_periodos_escala ADD COLUMN IF NOT EXISTS ambito TEXT NOT NULL DEFAULT 'ALMACEN';
         """))
-
+        #  Meta individual de ejecutivos comerciales como variable del período
+        c.execute(text("""
+            ALTER TABLE app.bono_periodos
+            ADD COLUMN IF NOT EXISTS meta_ejecutivo_mensual NUMERIC NOT NULL DEFAULT 430000000;
+        """))
+        
     # ---------- FASE 2: SEMILLA (tablas ya confirmadas y visibles) ----------
     creados = []
     with eng.begin() as c:
@@ -1578,6 +1583,7 @@ def bootstrap_bono_variables():
         except Exception:
             pass  # la auditoría nunca debe impedir el arranque
 
+
 @st.cache_data(ttl=300, show_spinner=False)
 def _cargar_config_bono():
     per = conn.query("SELECT * FROM app.bono_periodos WHERE activo ORDER BY fecha_inicio")
@@ -1636,31 +1642,39 @@ def resolver_periodo_escala(fecha, ambito="ALMACEN"):
     return row, esc[esc["periodo_id"] == int(row["id"])]
 
 
-def crear_periodo_metas(nombre, f_ini, f_fin, usuario):
+def crear_periodo_metas(nombre, f_ini, f_fin, usuario, ambito="ALMACEN"):
+    """Crea un período de tramos de meta en el ámbito indicado (ALMACEN o EJECOM)."""
     with _pg_engine_bono().begin() as c:
         pid = c.execute(text("""
-            INSERT INTO app.bono_periodos_metas (nombre, fecha_inicio, fecha_fin, creado_por)
-            VALUES (:n, CAST(:fi AS date), CAST(:ff AS date), :u) RETURNING id
-        """), {"n": nombre, "fi": f_ini, "ff": f_fin, "u": usuario}).scalar()
+            INSERT INTO app.bono_periodos_metas (nombre, fecha_inicio, fecha_fin, ambito, creado_por)
+            VALUES (:n, CAST(:fi AS date), CAST(:ff AS date), :amb, :u) RETURNING id
+        """), {"n": nombre, "fi": f_ini, "ff": f_fin, "amb": ambito, "u": usuario}).scalar()
     _auditar_bono("bono_periodos_metas", pid, "CREATE", None,
-                  {"nombre": nombre, "fecha_inicio": str(f_ini), "fecha_fin": str(f_fin)})
+                  {"nombre": nombre, "fecha_inicio": str(f_ini), "fecha_fin": str(f_fin),
+                   "ambito": ambito})
     _cargar_periodos_metas.clear()
     return pid
 
 
-def crear_periodo_escala(nombre, f_ini, f_fin, usuario):
+def crear_periodo_escala(nombre, f_ini, f_fin, usuario, ambito="ALMACEN"):
+    """Crea un período de escala de rentabilidad en el ámbito indicado."""
     with _pg_engine_bono().begin() as c:
         pid = c.execute(text("""
-            INSERT INTO app.bono_periodos_escala (nombre, fecha_inicio, fecha_fin, creado_por)
-            VALUES (:n, CAST(:fi AS date), CAST(:ff AS date), :u) RETURNING id
-        """), {"n": nombre, "fi": f_ini, "ff": f_fin, "u": usuario}).scalar()
+            INSERT INTO app.bono_periodos_escala (nombre, fecha_inicio, fecha_fin, ambito, creado_por)
+            VALUES (:n, CAST(:fi AS date), CAST(:ff AS date), :amb, :u) RETURNING id
+        """), {"n": nombre, "fi": f_ini, "ff": f_fin, "amb": ambito, "u": usuario}).scalar()
     _auditar_bono("bono_periodos_escala", pid, "CREATE", None,
-                  {"nombre": nombre, "fecha_inicio": str(f_ini), "fecha_fin": str(f_fin)})
+                  {"nombre": nombre, "fecha_inicio": str(f_ini), "fecha_fin": str(f_fin),
+                   "ambito": ambito})
     _cargar_periodos_escala.clear()
     return pid
 
+
 # ============================================================
 # CRUD ADICIONAL: actualizar y eliminar períodos de metas y escala
+# UNA sola definición de cada función (se eliminaron las copias
+# viejas sin ámbito y sin normalización de tipos, que eran las
+# que Python usaba por estar definidas de últimas).
 # ============================================================
 def _validar_sin_solape_tabla(tabla, f_ini, f_fin, excluir_id=None, ambito=None):
     per = conn.query(f"SELECT * FROM {tabla} WHERE activo")
@@ -1680,7 +1694,10 @@ def _validar_sin_solape_tabla(tabla, f_ini, f_fin, excluir_id=None, ambito=None)
 
 
 def actualizar_periodo_metas(pid, campos, usuario):
+    pid = int(pid)
     campos = {k: v for k, v in campos.items() if k in {"nombre", "fecha_inicio", "fecha_fin", "activo"}}
+    if not campos:
+        raise ValueError("No hay campos válidos para actualizar.")
     per = _cargar_periodos_metas()
     antes = per[per["id"] == pid]
     if antes.empty:
@@ -1701,7 +1718,10 @@ def actualizar_periodo_metas(pid, campos, usuario):
 
 
 def actualizar_periodo_escala(pid, campos, usuario):
+    pid = int(pid)
     campos = {k: v for k, v in campos.items() if k in {"nombre", "fecha_inicio", "fecha_fin", "activo"}}
+    if not campos:
+        raise ValueError("No hay campos válidos para actualizar.")
     per = _cargar_periodos_escala()
     antes = per[per["id"] == pid]
     if antes.empty:
@@ -1722,6 +1742,7 @@ def actualizar_periodo_escala(pid, campos, usuario):
 
 def eliminar_periodo_metas(pid, usuario):
     """Elimina un período de tramos y sus tramos asociados (CASCADE)."""
+    pid = int(pid)
     per = _cargar_periodos_metas()
     antes = per[per["id"] == pid]
     if antes.empty:
@@ -1738,6 +1759,7 @@ def eliminar_periodo_metas(pid, usuario):
 
 def eliminar_periodo_escala(pid, usuario):
     """Elimina un período de escala y sus rangos asociados (CASCADE)."""
+    pid = int(pid)
     per = _cargar_periodos_escala()
     antes = per[per["id"] == pid]
     if antes.empty:
@@ -1750,82 +1772,6 @@ def eliminar_periodo_escala(pid, usuario):
                   {"periodo": antes_dict, "rangos": rangos.to_dict("records")}, None)
     _cargar_periodos_escala.clear()
 
-def _validar_sin_solape_tabla(tabla, f_ini, f_fin, excluir_id=None):
-    per = conn.query(f"SELECT * FROM {tabla} WHERE activo")
-    ini = pd.Timestamp(f_ini)
-    fin = pd.Timestamp(f_fin) if f_fin else pd.Timestamp("2262-01-01")
-    for _, r in per.iterrows():
-        if excluir_id is not None and int(r["id"]) == int(excluir_id):
-            continue
-        r_fin = r["fecha_fin"] if pd.notna(r["fecha_fin"]) else pd.Timestamp("2262-01-01")
-        if ini <= r_fin and r["fecha_inicio"] <= fin:
-            raise ValueError(f"Se solapa con el período '{r['nombre']}'")
-
-
-def actualizar_periodo_metas(pid, campos, usuario):
-    campos = {k: v for k, v in campos.items() if k in {"nombre", "fecha_inicio", "fecha_fin", "activo"}}
-    per = _cargar_periodos_metas()
-    antes = per[per["id"] == pid]
-    if antes.empty:
-        raise ValueError("Período de tramos no encontrado")
-    antes_dict = antes.iloc[0].to_dict()
-    f_ini = campos.get("fecha_inicio", antes_dict["fecha_inicio"])
-    f_fin = campos.get("fecha_fin", antes_dict["fecha_fin"])
-    _validar_sin_solape_tabla("app.bono_periodos_metas", f_ini, f_fin, excluir_id=pid)
-    sets = ", ".join([f"{k} = :{k}" for k in campos])
-    params = dict(campos); params["pid"] = pid; params["u"] = usuario
-    with _pg_engine_bono().begin() as c:
-        c.execute(text(f"UPDATE app.bono_periodos_metas SET {sets}, actualizado_por = :u, actualizado_en = now() WHERE id = :pid"), params)
-    _auditar_bono("bono_periodos_metas", pid, "UPDATE", antes_dict, campos)
-    _cargar_periodos_metas.clear()
-    pct_bono_por_mes_almacen.clear()
-
-
-def actualizar_periodo_escala(pid, campos, usuario):
-    campos = {k: v for k, v in campos.items() if k in {"nombre", "fecha_inicio", "fecha_fin", "activo"}}
-    per = _cargar_periodos_escala()
-    antes = per[per["id"] == pid]
-    if antes.empty:
-        raise ValueError("Período de escala no encontrado")
-    antes_dict = antes.iloc[0].to_dict()
-    f_ini = campos.get("fecha_inicio", antes_dict["fecha_inicio"])
-    f_fin = campos.get("fecha_fin", antes_dict["fecha_fin"])
-    _validar_sin_solape_tabla("app.bono_periodos_escala", f_ini, f_fin, excluir_id=pid)
-    sets = ", ".join([f"{k} = :{k}" for k in campos])
-    params = dict(campos); params["pid"] = pid; params["u"] = usuario
-    with _pg_engine_bono().begin() as c:
-        c.execute(text(f"UPDATE app.bono_periodos_escala SET {sets}, actualizado_por = :u, actualizado_en = now() WHERE id = :pid"), params)
-    _auditar_bono("bono_periodos_escala", pid, "UPDATE", antes_dict, campos)
-    _cargar_periodos_escala.clear()
-
-
-def eliminar_periodo_metas(pid, usuario):
-    per = _cargar_periodos_metas()
-    antes = per[per["id"] == pid]
-    if antes.empty:
-        raise ValueError("Período de tramos no encontrado")
-    antes_dict = antes.iloc[0].to_dict()
-    tramos = conn.query("SELECT * FROM app.bono_metas_ventas WHERE periodo_id = :p", params={"p": pid})
-    with _pg_engine_bono().begin() as c:
-        c.execute(text("DELETE FROM app.bono_periodos_metas WHERE id = :pid"), {"pid": pid})
-    _auditar_bono("bono_periodos_metas", pid, "DELETE",
-                  {"periodo": antes_dict, "tramos": tramos.to_dict("records")}, None)
-    _cargar_periodos_metas.clear()
-    pct_bono_por_mes_almacen.clear()
-
-
-def eliminar_periodo_escala(pid, usuario):
-    per = _cargar_periodos_escala()
-    antes = per[per["id"] == pid]
-    if antes.empty:
-        raise ValueError("Período de escala no encontrado")
-    antes_dict = antes.iloc[0].to_dict()
-    rangos = conn.query("SELECT * FROM app.bono_escala_rentabilidad WHERE periodo_id = :p", params={"p": pid})
-    with _pg_engine_bono().begin() as c:
-        c.execute(text("DELETE FROM app.bono_periodos_escala WHERE id = :pid"), {"pid": pid})
-    _auditar_bono("bono_periodos_escala", pid, "DELETE",
-                  {"periodo": antes_dict, "rangos": rangos.to_dict("records")}, None)
-    _cargar_periodos_escala.clear()
 
 @st.cache_data(ttl=300, show_spinner=False)
 def pct_bono_por_mes_almacen():
@@ -1971,6 +1917,7 @@ def crear_periodo(nombre, f_ini, f_fin, factor, base, bloque, pct, metas, escala
 
 
 def actualizar_periodo(pid, campos: dict, usuario):
+    pid = int(pid) 
     campos = {k: v for k, v in campos.items() if k in CAMPOS_PERIODO_PERMITIDOS}
     per, met, esc = _cargar_config_bono()
     antes = per[per["id"] == pid]
@@ -1991,6 +1938,7 @@ def actualizar_periodo(pid, campos: dict, usuario):
 
 
 def reemplazar_metas(periodo_id, metas, usuario):
+    periodo_id = int(periodo_id) 
     per, met, _ = _cargar_config_bono()
     antes = met[met["periodo_id"] == periodo_id].to_dict("records")
     with _pg_engine_bono().begin() as c:
@@ -2005,6 +1953,7 @@ def reemplazar_metas(periodo_id, metas, usuario):
 
 
 def reemplazar_escala(periodo_id, escala, usuario):
+    periodo_id = int(periodo_id)
     per, _, esc = _cargar_config_bono()
     antes = esc[esc["periodo_id"] == periodo_id].to_dict("records")
     with _pg_engine_bono().begin() as c:

@@ -19,6 +19,7 @@ from src.conexion_db import (
     ESCALA_RENT_DEFAULT,
     METAS_2026,
     METAS_EJECOM_DEFAULT,
+    METAS_EJECOM_DEFAULT, 
 )
 
 st.set_page_config(page_title="Variables del Bono", page_icon=":material/tune:", layout="wide")
@@ -157,7 +158,7 @@ with tab_new:
                 else:
                     try:
                         if periodo_copiar != "Ninguno (valores por defecto)":
-                            pid_orig = per[per["nombre"] == periodo_copiar]["id"].iloc[0]
+                            pid_orig = int(per[per["nombre"] == periodo_copiar]["id"].iloc[0]) 
                             metas_t = [(float(r["umbral_min"]), bool(r["min_inclusivo"]),
                                         float(r["umbral_max"]) if pd.notna(r["umbral_max"]) else None,
                                         bool(r["max_inclusivo"]), float(r["pct_aplica"]))
@@ -223,7 +224,7 @@ with tab_new:
 with tab_edit:
     st.markdown("### Parámetros generales")
     periodo_sel = st.selectbox("Período general a editar:", per["nombre"].tolist(), key="sel_gen")
-    periodo_id = per[per["nombre"] == periodo_sel]["id"].iloc[0]
+    periodo_id = int(per[per["nombre"] == periodo_sel]["id"].iloc[0])
     periodo_row = per[per["id"] == periodo_id].iloc[0]
     with st.form("form_params"):
         col1, col2, col3 = st.columns(3)
@@ -264,7 +265,7 @@ with tab_edit:
         st.info(f"Sin períodos de tramos para {NOM_AMBITO[ambito_edit]}. Créalo en la pestaña 'Crear período'.")
     else:
         sel_m = st.selectbox("Período de tramos:", pm_edit["nombre"].tolist(), key=f"sel_m_{ambito_edit}")
-        pid_m = pm_edit[pm_edit["nombre"] == sel_m]["id"].iloc[0]
+        pid_m = int(pm_edit[pm_edit["nombre"] == sel_m]["id"].iloc[0])
         row_m = pm_edit[pm_edit["id"] == pid_m].iloc[0]
         with st.form(f"form_per_metas_{ambito_edit}"):
             c1, c2, c3 = st.columns(3)
@@ -327,7 +328,7 @@ with tab_edit:
         st.info(f"Sin períodos de escala para {NOM_AMBITO[ambito_edit]}. Créalo en la pestaña 'Crear período'.")
     else:
         sel_e = st.selectbox("Período de escala:", pe_edit["nombre"].tolist(), key=f"sel_e_{ambito_edit}")
-        pid_e = pe_edit[pe_edit["nombre"] == sel_e]["id"].iloc[0]
+        pid_e = int(pe_edit[pe_edit["nombre"] == sel_e]["id"].iloc[0])
         row_e = pe_edit[pe_edit["id"] == pid_e].iloc[0]
         with st.form(f"form_per_esc_{ambito_edit}"):
             c1, c2, c3 = st.columns(3)

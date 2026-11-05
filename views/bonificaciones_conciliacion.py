@@ -1,23 +1,12 @@
 """
-CONCILIACIÓN BONO
-Auditoría mensual del bono por almacén y por ejecutivo comercial.
-
-Ambas pestañas siguen el mismo esquema de informe:
-    1. Resumen y cumplimiento de meta
-    2. Exentas
-    3. Liquidación del bono
-    4. Descomposición del Valor Bono
-    5. Control de pagos en conciliación consolidada
-El cálculo individual de ejecutivos vive en src/bono_ejecom.py (probado de forma aislada).
+CONCILIACIÓN BONO — Auditoría mensual por almacén y por ejecutivo comercial.
+Pestañas: Almacenes | Ejecutivos Comerciales + informe completo descargable.
+Los cálculos son idénticos a la versión validada; solo cambia presentación y orden.
 """
 import io
-from datetime import date
-from html import escape
-
-import numpy as np
 import pandas as pd
+import numpy as np
 import streamlit as st
-
 from src.conexion_db import (
     conn,
     MAP_SERIE_FACTURA,
@@ -25,132 +14,52 @@ from src.conexion_db import (
     cargar_bonos_anticipos,
     cargar_pagos_consolidados,
     calcular_distribucion_bono_almacen,
+    obtener_exentas_auditadas_por_almacen,
     resolver_periodo_metas,
     resolver_periodo_escala,
     resolver_periodo_bono,
-)
-from src.bono_ejecom import (
-    FACTOR_BASE,
-    FACTOR_IVA,
-    META_EJECUTIVO_DEFECTO,
-    TASA_ANTICIPO,
-    TASA_DESCUENTO_CONSOLIDADO,
-    bono_total,
-    clave,
-    liquidar_ejecutivos,
-    pct_escala,
-    pct_tramo,
-    tramos_por_defecto,
+    _match_intervalo,
 )
 
-st.set_page_config(page_title="Conciliación Bono", layout="wide", initial_sidebar_state="expanded")
-
+st.set_page_config(page_title="Conciliación Bono", page_icon=":material/fact_check:",
+                   layout="wide", initial_sidebar_state="expanded")
 ROLES_BONIFICACIONES = ["admin", "gerente", "gerente_comercial"]
 if st.session_state.get("rol_actual") not in ROLES_BONIFICACIONES:
     st.error("Acceso denegado. El módulo de Bonificaciones está disponible únicamente para Gerencia y Administrador.")
     st.stop()
 
-EJECOM_NOM = "EJECUTIVOS COMERCIALES"
-EJECOM_COD = "EJECOM"
-TOL_CUADRE = 1.0                 # pesos
-APLICA_META_ADICIONAL_EJECOM = False   # pendiente de definición de negocio (ver Criterios de cálculo)
-MESES_ES = ["Enero", "Febrero", "Marzo", "Abril", "Mayo", "Junio", "Julio", "Agosto",
-            "Septiembre", "Octubre", "Noviembre", "Diciembre"]
-
-# ============================================================
-# ESTILO: tarjetas de KPI con borde, tipografía compacta y rejilla adaptable
-# (colores neutros: funcionan en tema claro y oscuro)
-# ============================================================
+# Tipografía compacta para métricas y tarjetas (UX de informe, no de dashboard)
 st.markdown("""
 <style>
-.kpi-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(175px, 1fr));
-            gap: 10px; margin: 4px 0 16px 0; }
-.kpi { border: 1px solid rgba(128,128,128,.35); border-radius: 6px; padding: 10px 12px; min-width: 0; }
-.kpi-l { font-size: .70rem; letter-spacing: .04em; text-transform: uppercase; opacity: .72; line-height: 1.25; }
-.kpi-v { font-size: clamp(1rem, 1.5vw, 1.28rem); font-weight: 650; line-height: 1.25; margin-top: 5px;
-         font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
-.kpi-s { font-size: .72rem; opacity: .62; margin-top: 3px; line-height: 1.25; }
-h2, h3 { letter-spacing: -.01em; }
+div[data-testid="stMetric"] { text-align: left; padding-top: 8px; }
+div[data-testid="stMetricLabel"] { font-size: 0.82rem !important; font-weight: 600; color: #555; }
+div[data-testid="stMetricValue"] { font-size: 1.22rem !important; font-weight: 700; color: #1f77b4; }
+div[data-testid="stVerticalBlockBorderWrapper"] { padding: 6px 12px; }
 </style>
 """, unsafe_allow_html=True)
 
+st.title("Conciliación Bono")
+st.caption("Auditoría mensual del bono: tramos de meta, escala de rentabilidad, exentas, anticipos y "
+           "pagos consolidados por almacén; evaluación individual por ejecutivo comercial.")
 
-# ============================================================
-# FORMATO
-# ============================================================
-def fmt_mes(p) -> str:
-    return f"{MESES_ES[p.month - 1]} {p.year}"
-
-
-def fmt_cop(v) -> str:
-    if v is None or pd.isna(v):
-        return "-"
-    return f"-${abs(v):,.0f}" if v < 0 else f"${v:,.0f}"
+EJECOM_NOM = "EJECUTIVOS COMERCIALES"
 
 
-def fmt_pct(v, dec=1) -> str:
-    return "-" if v is None or pd.isna(v) else f"{v * 100:,.{dec}f}%"
+def aplicar_tramo_ventas(pvp, tramos_df):
+    if tramos_df is None or tramos_df.empty:
+        return 0.0
+    tramo = _match_intervalo(float(pvp), tramos_df, "umbral_min", "min_inclusivo", "umbral_max", "max_inclusivo")
+    return float(tramo["pct_aplica"]) if tramo is not None else 0.0
 
 
-def md(s: str) -> str:
-    """Escapa el signo $ para que st.caption/st.markdown no lo interprete como fórmula."""
-    return s.replace("$", r"\$")
+def aplicar_escala_rent(rent_ratio, escala_df):
+    if escala_df is None or escala_df.empty:
+        return -1.0
+    rango = _match_intervalo(float(rent_ratio), escala_df, "cond_min", "min_inclusivo", "cond_max", "max_inclusivo")
+    return float(rango["pct_bono"]) if rango is not None else -1.0
 
 
-def tarjetas(items):
-    """items: lista de (etiqueta, valor, nota_opcional)."""
-    html = ['<div class="kpi-grid">']
-    for it in items:
-        lab, val = it[0], it[1]
-        sub = it[2] if len(it) > 2 else ""
-        s = f'<div class="kpi-s">{escape(sub)}</div>' if sub else ""
-        html.append(f'<div class="kpi"><div class="kpi-l">{escape(lab)}</div>'
-                    f'<div class="kpi-v">{escape(val)}</div>{s}</div>')
-    html.append("</div>")
-    # el signo $ se escribe como entidad para que Markdown no lo interprete como fórmula
-    st.markdown("".join(html).replace("$", "&#36;"), unsafe_allow_html=True)
-
-
-def cop():
-    return st.column_config.NumberColumn(format="$%,.2f")
-
-
-def pct():
-    return st.column_config.NumberColumn(format="%.2f%%")
-
-
-def x100(df, cols):
-    df = df.copy()
-    for c in cols:
-        if c in df.columns:
-            df[c] = df[c] * 100.0
-    return df
-
-
-def tabla(df, config=None):
-    st.dataframe(df, use_container_width=True, hide_index=True, column_config=config or {})
-
-
-def _canon_alm(x) -> str:
-    """Clave de almacén sin espacios: 'PUNTO 170' y 'PUNTO170' son el mismo almacén."""
-    return "".join(str(x).upper().split())
-
-
-# ============================================================
-# ESCALARES SOBRE LOS HELPERS VECTORIZADOS (misma semántica que _match_intervalo)
-# ============================================================
-def tramo_escalar(v, tramos) -> float:
-    return float(pct_tramo(pd.Series([float(v)]), tramos).iloc[0])
-
-
-def escala_escalar(v, escala) -> float:
-    return float(pct_escala(pd.Series([float(v)]), escala).iloc[0])
-
-
-# ============================================================
-# CARGA DE DATOS
-# ============================================================
-@st.cache_data(ttl=3600, show_spinner="Cargando base de facturas y notas crédito...")
+@st.cache_data(ttl=3600, show_spinner="Cargando base de facturas y NC...")
 def cargar_facturas_nc_agregadas():
     q = """
         SELECT nombre_serie,
@@ -169,161 +78,159 @@ def cargar_facturas_nc_agregadas():
     return df
 
 
-@st.cache_data(ttl=3600, show_spinner=False)
-def cargar_ventas_ejecom_mes(desde, hasta):
-    return conn.query("""
-        SELECT nombre_vendedor, MAX(documento_identidad) AS cedula,
-               SUM(precio_sin_iva) AS pvp, SUM(costo_total) AS costo, SUM(rentabilidad) AS rentabilidad,
-               SUM(precio_sin_iva) FILTER (WHERE tax_code IN ('IVAEXE','IVDEXE','IVAIEXE')) AS exentas
-        FROM sap_raw.ventas_netas
-        WHERE nombre_almacen = 'EJECOM' AND fecha_contabilizacion::date BETWEEN :d AND :h
-        GROUP BY nombre_vendedor
-    """, params={"d": desde, "h": hasta})
-
-
-@st.cache_data(ttl=3600, show_spinner=False)
-def cargar_ventas_ejecom_historico():
-    return conn.query("""
-        SELECT EXTRACT(YEAR FROM fecha_contabilizacion)::int AS anio,
-               EXTRACT(MONTH FROM fecha_contabilizacion)::int AS mes,
-               nombre_vendedor, SUM(precio_sin_iva) AS pvp
-        FROM sap_raw.ventas_netas
-        WHERE nombre_almacen = 'EJECOM'
-        GROUP BY 1, 2, 3
-    """)
-
-
-def cargar_decisiones_mes(periodo_mes: str) -> dict:
-    """
-    Decisiones de Contabilidad del mes en UNA consulta.
-    Devuelve {(almacén_canónico, comercial_canónico): pesos} solo para decisiones 'corregido'.
-    Gana la decisión más reciente, igual que obtener_decision_contabilidad: si la última es
-    'aprobado' o pendiente, se usa el valor calculado.
-    """
-    df = conn.query("""
-        SELECT nombre_almacen, nombre_comercial, decision, valor_corregido
-        FROM app.contabilidad_decisiones_exentas
-        WHERE periodo_mes = :pm
-        ORDER BY fecha_decision
-    """, params={"pm": periodo_mes}, ttl=0)
-    out = {}
-    for r in df.itertuples(index=False):
-        k = (_canon_alm(r.nombre_almacen), clave(r.nombre_comercial or ""))
-        if r.decision == "corregido" and pd.notna(r.valor_corregido):
-            out[k] = float(r.valor_corregido)
-        else:
-            out.pop(k, None)
-    return out
-
-
 df_fac = cargar_facturas_nc_agregadas()
 if df_fac.empty:
-    st.warning("Sin datos de facturas y notas crédito en sap_raw.ventas_netas. Ejecute Forzar Sincronización SAP.")
+    st.warning("Sin datos de facturas/NC en sap_raw.ventas_netas. Ejecuta Forzar Sincronización SAP.")
     st.stop()
 df_fac["nom_almacen"] = df_fac["nombre_serie"].map(MAP_SERIE_FACTURA).fillna("OTRO")
 
-# ============================================================
-# FILTROS
-# ============================================================
 with st.sidebar:
     st.markdown("### Filtros")
     meses_disponibles = sorted(df_fac["fecha"].dt.to_period("M").unique())
-    mes_sel = st.selectbox("Mes a evaluar", options=meses_disponibles, index=len(meses_disponibles) - 1,
-                           format_func=fmt_mes, key="sb_conc_mes")
+    mes_default = pd.Period("2025-12", freq="M") if pd.Period("2025-12", freq="M") in meses_disponibles else meses_disponibles[-1]
+    mes_sel = st.selectbox("Mes a evaluar:", options=meses_disponibles,
+                           index=list(meses_disponibles).index(mes_default),
+                           format_func=lambda p: p.strftime("%B %Y"), key="sb_conc_mes")
     alm_disp = sorted(n for n in df_fac["nom_almacen"].unique() if n != EJECOM_NOM)
-    alm_sel = st.multiselect("Almacén", alm_disp, default=alm_disp, key="sb_conc_alm")
+    alm_sel = st.multiselect("Almacén:", alm_disp, default=alm_disp, key="sb_conc_alm")
 
 desde = mes_sel.start_time.date()
 hasta = mes_sel.end_time.date()
 periodo_mes_str = f"{desde:%Y-%m}"
 
-# ============================================================
-# PERÍODOS VIGENTES (almacenes y ejecutivos)
-# ============================================================
 periodo_metas, tramos_metas = resolver_periodo_metas(desde)
 periodo_escala, rangos_escala = resolver_periodo_escala(desde)
 periodo_general, _, _ = resolver_periodo_bono(desde)
 if periodo_metas is None or periodo_escala is None or periodo_general is None:
-    st.error("No hay configuración de períodos para el mes seleccionado. Configure los períodos en Variables del Bono.")
+    st.error("No hay configuración de períodos para el mes seleccionado. Configura los períodos en Variables del Bono.")
     st.stop()
 
+META_EJECUTIVO_MENSUAL = float(periodo_general.get("meta_ejecutivo_mensual") or 0) or 430_000_000.0
 factor_desc_exentas = float(periodo_general["factor_desc_exentas"])
 
-# Ejecutivos: tramos y escala del ámbito EJECOM; si no existen, valores por defecto.
-meta_cfg = float(periodo_general.get("meta_ejecutivo_mensual") or 0) or META_EJECUTIVO_DEFECTO
-periodo_metas_ej, tramos_ej = resolver_periodo_metas(desde, EJECOM_COD)
-fuente_meta_ej = periodo_metas_ej["nombre"] if periodo_metas_ej is not None else f"valor por defecto ({fmt_cop(meta_cfg)})"
-if tramos_ej is None or len(tramos_ej) == 0:
-    tramos_ej = tramos_por_defecto(meta_cfg)
-periodo_escala_ej, escala_ej = resolver_periodo_escala(desde, EJECOM_COD)
-fuente_escala_ej = periodo_escala_ej["nombre"] if periodo_escala_ej is not None else "escala de almacenes"
-if escala_ej is None or len(escala_ej) == 0:
-    escala_ej = rangos_escala
-
-_cache_tramos = {}
+# Decisiones de Contabilidad del mes en UNA consulta: (tipo, almacén, comercial) -> pesos
+_df_dec = conn.query("""
+    SELECT tipo_registro, nombre_almacen, nombre_comercial, decision, valor_corregido
+    FROM app.contabilidad_decisiones_exentas WHERE periodo_mes = :pm
+""", params={"pm": periodo_mes_str}, ttl=0)
+DEC_PESOS = {(r["tipo_registro"], r["nombre_almacen"], r["nombre_comercial"]): float(r["valor_corregido"])
+             for _, r in _df_dec.iterrows()
+             if r["decision"] == "corregido" and r["valor_corregido"] is not None}
 
 
-def resolver_tramos_ej(anio: int, mes: int):
-    """Tramos EJECOM vigentes en el mes de la factura (con respaldo al período evaluado)."""
-    k = (anio, mes)
-    if k not in _cache_tramos:
-        _, t = resolver_periodo_metas(date(anio, mes, 1), EJECOM_COD)
-        _cache_tramos[k] = t if t is not None and len(t) else tramos_ej
-    return _cache_tramos[k]
+def dec_pesos(tipo, alm, com=""):
+    return DEC_PESOS.get((tipo, alm, com))
 
 
 # ============================================================
-# DECISIONES DE CONTABILIDAD (una consulta por mes)
-# ============================================================
-DEC = cargar_decisiones_mes(periodo_mes_str)
-DEC_ALM = {a: v for (a, c), v in DEC.items() if c == ""}
-DEC_EJ = {c: v for (a, c), v in DEC.items() if a == _canon_alm(EJECOM_NOM) and c != ""}
-
-# ============================================================
-# BASES DE PAGOS, ANTICIPOS Y CONSOLIDADOS
+# CÁLCULO 1: EJECOM (pool conciliado + evaluación individual)
 # ============================================================
 df_pagos_all = cargar_bonos_pagos()
 if df_pagos_all.empty or "estado_comision" not in df_pagos_all.columns:
-    st.warning("Sin datos de pagos. Ejecute Forzar Sincronización SAP o verifique que Variables del Bono esté inicializado.")
+    st.warning("Sin datos de pagos. Ejecuta Forzar Sincronización SAP o verifica que Variables del Bono esté inicializado.")
     st.stop()
-df_ant_all = cargar_bonos_anticipos()
-df_cons_all = cargar_pagos_consolidados()
+
+pagos_ej = df_pagos_all[
+    (df_pagos_all["estado_comision"] == "Pago Aplicado en el Mes")
+    & (df_pagos_all["nombre_almacen"] == EJECOM_NOM)
+    & (df_pagos_all["fecha_aplicacion"].dt.date >= desde)
+    & (df_pagos_all["fecha_aplicacion"].dt.date <= hasta)
+]
+liq_ej = (pagos_ej.groupby("nom_empleado")["liquidacion_ok"].sum()
+          if not pagos_ej.empty else pd.Series(dtype=float))
+
+pool = calcular_distribucion_bono_almacen(desde, hasta, [EJECOM_NOM])
+pool_pagos = float(pool["liq_pagos"].sum()) if not pool.empty else 0.0
+pool_ants = float(pool["liq_anticipos"].sum()) if not pool.empty else 0.0
+pool_desc = float(pool["descuento_liq"].sum()) if not pool.empty else 0.0
+pool_valor = float(pool["Total_Bono"].sum()) if not pool.empty else 0.0
+factor_pool = (pool_valor / pool_pagos) if pool_pagos > 0 else 0.0
+
+df_ventas_ej = conn.query("""
+    SELECT nombre_vendedor, MAX(documento_identidad) AS cedula,
+           SUM(precio_sin_iva) AS pvp, SUM(costo_total) AS costo, SUM(rentabilidad) AS rentabilidad,
+           SUM(precio_sin_iva) FILTER (WHERE tax_code IN ('IVAEXE','IVDEXE','IVAIEXE')) AS exentas
+    FROM sap_raw.ventas_netas
+    WHERE nombre_almacen = 'EJECOM' AND fecha_contabilizacion::date BETWEEN :d AND :h
+    GROUP BY nombre_vendedor
+""", params={"d": desde, "h": hasta})
+
+filas_ej = []
+for _, r in df_ventas_ej.iterrows():
+    nom = r["nombre_vendedor"]
+    pvp, costo, rent = float(r["pvp"] or 0), float(r["costo"] or 0), float(r["rentabilidad"] or 0)
+    cumple = pvp >= META_EJECUTIVO_MENSUAL
+    pct_rent = (rent / costo * 100.0) if costo else 0.0
+    pct_bono = aplicar_escala_rent(pct_rent / 100.0, rangos_escala)
+    valor_bono = float(liq_ej.get(nom, 0.0)) * factor_pool
+    bono_total = valor_bono * pct_bono if pct_bono >= 0 else valor_bono * (1.0 + pct_bono)
+    dec_ej = dec_pesos("comercial", EJECOM_NOM, nom)
+    filas_ej.append({
+        "Ejecutivo": nom, "Cédula": r["cedula"], "PVP": pvp, "Meta": META_EJECUTIVO_MENSUAL,
+        "% Cumplimiento": (pvp / META_EJECUTIVO_MENSUAL * 100.0) if META_EJECUTIVO_MENSUAL else 0.0,
+        "Cumple_Meta": cumple,
+        "PVP_faltante": max(0.0, META_EJECUTIVO_MENSUAL - pvp),
+        "% Rent (Costo)": pct_rent, "% Bono": pct_bono * 100.0,
+        "Valor_Bono": valor_bono, "Bono_Total": bono_total,
+        "Bono_si_cumpliera": bono_total, "% Meta_Adic": 0.0,
+        "Bono_Final": bono_total if cumple else 0.0,
+        "Liq_Pagos": float(liq_ej.get(nom, 0.0)),          # liquidación de pagos propia del ejecutivo
+        "Exentas_SAP": float(r["exentas"] or 0.0),         # exentas calculadas por SAP
+        "Decision_Cont": dec_ej,                           # corrección de Contabilidad (None si no hay)
+        "Exentas_Auditadas": dec_ej if dec_ej is not None else float(r["exentas"] or 0.0),
+    })
+df_ejec = pd.DataFrame(filas_ej).sort_values("PVP", ascending=False)
+atribuido = float(df_ejec["Valor_Bono"].sum()) if not df_ejec.empty else 0.0
+no_atribuido = pool_valor - atribuido
+n_cumplen = int(df_ejec["Cumple_Meta"].sum()) if not df_ejec.empty else 0
+bf_ejec = float(df_ejec["Bono_Final"].sum()) if not df_ejec.empty else 0.0
 
 # ============================================================
-# CÁLCULO: ALMACENES
+# CÁLCULO 2: ALMACENES (tablas 1 a 4 + descomposición)
 # ============================================================
 dff = df_fac[(df_fac["fecha"].dt.date >= desde) & (df_fac["fecha"].dt.date <= hasta)]
 dff = dff[dff["nom_almacen"] != EJECOM_NOM]
 if alm_sel:
     dff = dff[dff["nom_almacen"].isin(alm_sel)]
 
-tabla1 = tabla2 = t3 = descomp = tabla_cons = pd.DataFrame()
-fila_total1 = fila_total2 = fila_total3 = fila_total_cons = pd.DataFrame()
+tabla1 = pd.DataFrame()
+fila_total1 = pd.DataFrame()
+tabla2 = pd.DataFrame()
+fila_total2 = pd.DataFrame()
+t3 = pd.DataFrame()
+fila_total3 = pd.DataFrame()
+descomp = pd.DataFrame()
+tabla_cons = pd.DataFrame()
+fila_total_cons = pd.DataFrame()
 
 if not dff.empty:
-    # ---- 1. Resumen
+    # ---- Tabla 1 ----
     tabla1 = dff.groupby("nom_almacen", as_index=False).agg(
-        Precio_Total_PVP=("pvp", "sum"), Suma_Costo_Total=("costo_total", "sum"),
-        Suma_Rentabilidad=("rentabilidad", "sum"))
-    tabla1["Aplica_Bono_Del"] = pct_tramo(tabla1["Precio_Total_PVP"], tramos_metas).values * 100.0
+        Precio_Total_PVP=("pvp", "sum"),
+        Suma_Costo_Total=("costo_total", "sum"),
+        Suma_Rentabilidad=("rentabilidad", "sum"),
+    )
+    tabla1["Aplica_Bono_Del"] = tabla1["Precio_Total_PVP"].apply(lambda pvp: aplicar_tramo_ventas(pvp, tramos_metas) * 100.0)
     tabla1["Pct_Rent_Costo"] = np.where(tabla1["Suma_Costo_Total"] != 0,
                                         tabla1["Suma_Rentabilidad"] / tabla1["Suma_Costo_Total"] * 100.0, 0.0)
     tabla1 = tabla1.sort_values("Precio_Total_PVP", ascending=False)
     tp1, tc1, tr1 = (float(tabla1[c].sum()) for c in ("Precio_Total_PVP", "Suma_Costo_Total", "Suma_Rentabilidad"))
     fila_total1 = pd.DataFrame([{
         "nom_almacen": "Total", "Precio_Total_PVP": tp1, "Suma_Costo_Total": tc1, "Suma_Rentabilidad": tr1,
-        "Aplica_Bono_Del": tramo_escalar(tp1, tramos_metas) * 100.0,
+        "Aplica_Bono_Del": aplicar_tramo_ventas(tp1, tramos_metas) * 100.0,
         "Pct_Rent_Costo": (tr1 / tc1 * 100.0) if tc1 else 0.0}])
 
-    # ---- 2. Anticipos y exentas (exentas con el valor auditado por Contabilidad)
+    # ---- Tabla 2 ----
+    df_ant = cargar_bonos_anticipos()
     ant = pd.DataFrame()
-    if not df_ant_all.empty and "tipo_factura" in df_ant_all.columns:
-        ant = df_ant_all.copy()
+    if not df_ant.empty and "tipo_factura" in df_ant.columns:
+        ant = df_ant.copy()
         ant["tipo_factura"] = ant["tipo_factura"].astype(str).str.strip()
-        ant = ant[(ant["tipo_factura"] == "2") & ant["fecha_factura"].notna()]
+        ant = ant[ant["tipo_factura"] == "2"]
+        ant = ant[ant["fecha_factura"].notna()]
         ant = ant[(ant["fecha_recibo_pago"].dt.date >= desde) & (ant["fecha_recibo_pago"].dt.date <= hasta)]
         ant = ant[ant["fecha_aplicacion"].notna()
-                  & (ant["fecha_recibo_pago"].dt.to_period("M") != ant["fecha_aplicacion"].dt.to_period("M"))]
+                   & (ant["fecha_recibo_pago"].dt.to_period("M") != ant["fecha_aplicacion"].dt.to_period("M"))]
         ant["nom_almacen"] = ant["nombre_serie_pago"].map(MAP_SERIE_FACTURA).fillna("OTRO")
         if alm_sel:
             ant = ant[ant["nom_almacen"].isin(alm_sel)]
@@ -333,8 +240,9 @@ if not dff.empty:
              else pd.DataFrame(columns=["nom_almacen", "Suma_Total_Anticipo"]))
     g_ex = dff.groupby("nom_almacen", as_index=False)["exentas"].sum().rename(
         columns={"exentas": "Suma_Precio_Total_Exentas"})
-    g_ex["Suma_Precio_Total_Exentas"] = [
-        DEC_ALM.get(_canon_alm(a), v) for a, v in zip(g_ex["nom_almacen"], g_ex["Suma_Precio_Total_Exentas"])]
+    exentas_auditadas = obtener_exentas_auditadas_por_almacen(periodo_mes_str)
+    g_ex["Suma_Precio_Total_Exentas"] = g_ex.apply(
+        lambda r: float(exentas_auditadas.get(r["nom_almacen"], r["Suma_Precio_Total_Exentas"])), axis=1)
     tabla2 = pd.merge(g_ant, g_ex, on="nom_almacen", how="outer").fillna(0.0)
     tabla2["Total_Exentas"] = tabla2["Suma_Total_Anticipo"] + tabla2["Suma_Precio_Total_Exentas"]
     tabla2 = tabla2.sort_values("Total_Exentas", ascending=False)
@@ -344,7 +252,7 @@ if not dff.empty:
         "Suma_Precio_Total_Exentas": float(tabla2["Suma_Precio_Total_Exentas"].sum()),
         "Total_Exentas": float(tabla2["Total_Exentas"].sum())}])
 
-    # ---- 3. Liquidación
+    # ---- Tabla 3 ----
     distrib_bono = calcular_distribucion_bono_almacen(desde, hasta, alm_sel)
     t3 = tabla1[["nom_almacen", "Precio_Total_PVP", "Suma_Costo_Total", "Suma_Rentabilidad", "Pct_Rent_Costo"]].copy()
     t3 = t3.merge(tabla2[["nom_almacen", "Suma_Total_Anticipo", "Suma_Precio_Total_Exentas"]],
@@ -357,21 +265,30 @@ if not dff.empty:
     t3[["pagos_liq", "ant_liq", "desc_liq", "Valor_Bono"]] = t3[["pagos_liq", "ant_liq", "desc_liq", "Valor_Bono"]].fillna(0.0)
     t3["Pct_Exentas"] = np.where(t3["Precio_Total_PVP"] != 0, t3["total_exentas"] / t3["Precio_Total_PVP"], 0.0)
     t3["Desc_Exentas"] = t3["Pct_Exentas"] * factor_desc_exentas
-    t3["Pct_Bono"] = pct_escala(t3["Pct_Rent_Costo"] / 100.0, rangos_escala).values
-    t3["Bono_Total"] = bono_total(t3["Valor_Bono"], t3["Pct_Bono"])
+    for idx, row in t3.iterrows():
+        dec = dec_pesos("almacen", row["nom_almacen"], "")
+        if dec is not None:
+            pvp_row = float(row["Precio_Total_PVP"])
+            pct_ex = (dec / pvp_row) if pvp_row else 0.0
+            t3.at[idx, "Pct_Exentas"] = pct_ex
+            t3.at[idx, "Desc_Exentas"] = pct_ex * factor_desc_exentas
+    r = t3["Pct_Rent_Costo"] / 100.0
+    t3["Pct_Bono"] = r.apply(lambda rent: aplicar_escala_rent(rent, rangos_escala))
+    t3["Bono_Total"] = np.where(t3["Pct_Bono"] >= 0,
+                                t3["Valor_Bono"] * t3["Pct_Bono"],
+                                t3["Valor_Bono"] + (t3["Valor_Bono"] * t3["Pct_Bono"]))
     meta_base = float(periodo_general["meta_adic_base"])
     meta_bloque = float(periodo_general["meta_adic_bloque"])
     meta_pct = float(periodo_general["meta_adic_pct"])
     dif_meta = t3["Precio_Total_PVP"] - meta_base
     t3["Pct_Meta_Adicional"] = np.where(dif_meta > 0, np.trunc(dif_meta / meta_bloque) * meta_pct, 0.0)
-    t3["aplica"] = pct_tramo(t3["Precio_Total_PVP"], tramos_metas).values
+    t3["aplica"] = t3["Precio_Total_PVP"].apply(lambda pvp: aplicar_tramo_ventas(pvp, tramos_metas))
     t3["Bono_Final"] = np.where(t3["aplica"] != 0, (1.0 + t3["Pct_Meta_Adicional"]) * t3["Bono_Total"], 0.0)
     t3 = t3.sort_values("Valor_Bono", ascending=False)
-    tp = float(t3["Precio_Total_PVP"].sum())
-    te = float(t3["total_exentas"].sum())
-    tv = float(t3["Valor_Bono"].sum())
-    bt_sum = float(t3["Bono_Total"].sum())
-    bf_sum = float(t3["Bono_Final"].sum())
+    tp = float(t3["Precio_Total_PVP"].sum()); tc = float(t3["Suma_Costo_Total"].sum())
+    tr = float(t3["Suma_Rentabilidad"].sum()); te = float(t3["total_exentas"].sum())
+    tv = float(t3["Valor_Bono"].sum()); bt_sum = float(t3["Bono_Total"].sum()); bf_sum = float(t3["Bono_Final"].sum())
+
     fila_total3 = pd.DataFrame([{
         "nom_almacen": "Total",
         "Pct_Exentas": te / tp if tp else 0.0,
@@ -383,385 +300,415 @@ if not dff.empty:
         "Bono_Final": bf_sum}])
     descomp = t3[["nom_almacen", "pagos_liq", "ant_liq", "desc_liq", "Valor_Bono"]].copy()
 
-    # ---- 5. Control de consolidados
-    if not df_cons_all.empty:
-        dfc = df_cons_all[(df_cons_all["fecha_recibo"].dt.date >= desde) & (df_cons_all["fecha_recibo"].dt.date <= hasta)]
+    # ---- Tabla 4: control consolidados ----
+    df_cons = cargar_pagos_consolidados()
+    dfc = pd.DataFrame()
+    if not df_cons.empty:
+        dfc = df_cons[(df_cons["fecha_recibo"].dt.date >= desde) & (df_cons["fecha_recibo"].dt.date <= hasta)]
         dfc = dfc[dfc["nombre_almacen"] != EJECOM_NOM]
         if alm_sel:
             dfc = dfc[dfc["nombre_almacen"].isin(alm_sel)]
-        if not dfc.empty:
-            tabla_cons = dfc[["pago_nro", "fecha_recibo", "nombre_almacen", "nombre_cliente",
-                              "pr", "vr_aplicado", "diferencia", "n_facturas", "n_aplicaciones"]].copy()
-            tabla_cons["descuento_liq"] = tabla_cons["diferencia"] * TASA_DESCUENTO_CONSOLIDADO
-            fila_total_cons = pd.DataFrame([{
-                "pago_nro": "Total", "fecha_recibo": pd.NaT, "nombre_almacen": "",
-                "nombre_cliente": f"{len(tabla_cons)} pagos observados",
-                "pr": tabla_cons["pr"].sum(), "vr_aplicado": tabla_cons["vr_aplicado"].sum(),
-                "diferencia": tabla_cons["diferencia"].sum(),
-                "descuento_liq": tabla_cons["descuento_liq"].sum(),
-                "n_facturas": None, "n_aplicaciones": None}])
-
-# ============================================================
-# CÁLCULO: EJECUTIVOS COMERCIALES
-# ============================================================
-ventas_ej = cargar_ventas_ejecom_mes(desde, hasta)
-ventas_ej_hist = cargar_ventas_ejecom_historico()
-
-pagos_ej = df_pagos_all[
-    (df_pagos_all["estado_comision"] == "Pago Aplicado en el Mes")
-    & (df_pagos_all["nombre_almacen"] == EJECOM_NOM)
-    & (df_pagos_all["fecha_aplicacion"].dt.date >= desde)
-    & (df_pagos_all["fecha_aplicacion"].dt.date <= hasta)
-]
-if "liq_sin_bono" not in pagos_ej.columns:
-    st.error("La base de pagos no incluye liq_sin_bono. Verifique la versión de src/conexion_db.py.")
-    st.stop()
-
-# Pool EJECOM sin ponderar: anticipos (liquidación base) y descuento por conciliación consolidada.
-ant_base_pool = 0.0
-if not df_ant_all.empty:
-    a = df_ant_all[(df_ant_all["nombre_almacen"] == EJECOM_NOM)
-                   & (df_ant_all["fecha_recibo_pago"].dt.date >= desde)
-                   & (df_ant_all["fecha_recibo_pago"].dt.date <= hasta)]
-    mv = a["monto_validado"].where(a["monto_validado"] > 0, 0.0)
-    ant_base_pool = float((mv / FACTOR_IVA * FACTOR_BASE * TASA_ANTICIPO).sum())
-
-tabla_cons_ej = pd.DataFrame()
-fila_total_cons_ej = pd.DataFrame()
-desc_pool = 0.0
-if not df_cons_all.empty:
-    dfc_ej = df_cons_all[(df_cons_all["fecha_recibo"].dt.date >= desde)
-                         & (df_cons_all["fecha_recibo"].dt.date <= hasta)
-                         & (df_cons_all["nombre_almacen"] == EJECOM_NOM)]
-    if not dfc_ej.empty:
-        tabla_cons_ej = dfc_ej[["pago_nro", "fecha_recibo", "nombre_almacen", "nombre_cliente",
-                                "pr", "vr_aplicado", "diferencia", "n_facturas", "n_aplicaciones"]].copy()
-        tabla_cons_ej["descuento_liq"] = tabla_cons_ej["diferencia"] * TASA_DESCUENTO_CONSOLIDADO
-        desc_pool = float(tabla_cons_ej["descuento_liq"].sum())
-        fila_total_cons_ej = pd.DataFrame([{
+    if not dfc.empty:
+        tabla_cons = dfc[["pago_nro", "fecha_recibo", "nombre_almacen", "nombre_cliente",
+                          "pr", "vr_aplicado", "diferencia", "n_facturas", "n_aplicaciones"]].copy()
+        tabla_cons["descuento_liq"] = tabla_cons["diferencia"] * 0.008
+        fila_total_cons = pd.DataFrame([{
             "pago_nro": "Total", "fecha_recibo": pd.NaT, "nombre_almacen": "",
-            "nombre_cliente": f"{len(tabla_cons_ej)} pagos observados",
-            "pr": tabla_cons_ej["pr"].sum(), "vr_aplicado": tabla_cons_ej["vr_aplicado"].sum(),
-            "diferencia": tabla_cons_ej["diferencia"].sum(), "descuento_liq": desc_pool,
+            "nombre_cliente": f"{len(tabla_cons)} pagos observados",
+            "pr": tabla_cons["pr"].sum(), "vr_aplicado": tabla_cons["vr_aplicado"].sum(),
+            "diferencia": tabla_cons["diferencia"].sum(),
+            "descuento_liq": tabla_cons["descuento_liq"].sum(),
             "n_facturas": None, "n_aplicaciones": None}])
 
-meta_adic_ej = ({"base": float(periodo_general["meta_adic_base"]),
-                 "bloque": float(periodo_general["meta_adic_bloque"]),
-                 "pct": float(periodo_general["meta_adic_pct"])}
-                if APLICA_META_ADICIONAL_EJECOM else None)
-
-df_ej, pool_ej = liquidar_ejecutivos(
-    ventas_mes=ventas_ej, ventas_hist=ventas_ej_hist,
-    pagos=pagos_ej[["nom_empleado", "fecha_factura", "liq_sin_bono"]],
-    ant_base_pool=ant_base_pool, desc_pool=desc_pool,
-    tramos=tramos_ej, escala=escala_ej, resolver_tramos=resolver_tramos_ej,
-    exentas_auditadas=DEC_EJ, factor_desc_exentas=factor_desc_exentas, meta_adicional=meta_adic_ej)
-
-
 # ============================================================
-# TABLAS DE PRESENTACIÓN (las usan la pantalla y el informe Excel)
+# INFORME COMPLETO (Excel multi-hoja)
 # ============================================================
-def _fila_total(nombre, **vals):
-    return pd.DataFrame([{"Ejecutivo": nombre, **vals}])
-
-
-def tablas_ejecutivos(df: pd.DataFrame, pool: dict) -> dict:
-    if df.empty:
-        return {}
-    n = int(df["Meta"].notna().sum())          # ejecutivos evaluados (sin la fila Sin Vendedor)
-    pvp, costo, rent = (float(df[c].sum()) for c in ("PVP", "Costo", "Rentabilidad"))
-    meta_tot = float(df["Meta"].sum())
-    pvp_con_meta = float(df.loc[df["Meta"].notna(), "PVP"].sum())
-
-    # 1. Resumen y cumplimiento
-    t1 = df[["Ejecutivo", "Cedula", "PVP", "Meta", "Pct_Cumplimiento", "Pct_Aplica",
-             "PVP_Faltante", "Costo", "Rentabilidad", "Pct_Rent_Costo"]].copy()
-    tot1 = _fila_total(f"Total ({n})", Cedula="", PVP=pvp, Meta=meta_tot,
-                       Pct_Cumplimiento=(pvp_con_meta / meta_tot) if meta_tot else np.nan, Pct_Aplica=np.nan,
-                       PVP_Faltante=float(df["PVP_Faltante"].sum()), Costo=costo, Rentabilidad=rent,
-                       Pct_Rent_Costo=(rent / costo) if costo else np.nan)
-    t1 = x100(pd.concat([t1, tot1], ignore_index=True), ["Pct_Cumplimiento", "Pct_Aplica", "Pct_Rent_Costo"]).rename(columns={
-        "Cedula": "Cédula", "Pct_Cumplimiento": "% Cumplimiento", "Pct_Aplica": "Aplica Bono del",
-        "PVP_Faltante": "PVP faltante para meta", "Costo": "Suma de Costo total",
-        "Rentabilidad": "Suma de Rentabilidad", "Pct_Rent_Costo": "% Rent (Costo)", "PVP": "Precio Total PVP"})
-
-    # 2. Exentas
-    t2 = df[["Ejecutivo", "Exentas_Calc", "Exentas_Aud"]].copy()
-    t2["Diferencia"] = t2["Exentas_Aud"] - t2["Exentas_Calc"]
-    tot2 = _fila_total(f"Total ({n})", Exentas_Calc=float(t2["Exentas_Calc"].sum()),
-                       Exentas_Aud=float(t2["Exentas_Aud"].sum()), Diferencia=float(t2["Diferencia"].sum()))
-    t2 = pd.concat([t2, tot2], ignore_index=True).rename(columns={
-        "Exentas_Calc": "Exentas calculadas (SAP)", "Exentas_Aud": "Exentas auditadas (Contabilidad)"})
-
-    # 3. Liquidación
-    t3e = df[["Ejecutivo", "Pct_Exentas", "Desc_Exentas", "Valor_Bono", "Pct_Bono", "Bono_Total",
-              "Pct_Meta_Adicional", "Bono_Final", "Bono_Si_Cumpliera"]].copy()
-    ex_aud = float(df["Exentas_Aud"].sum())
-    vb, bt, bf = (float(df[c].sum()) for c in ("Valor_Bono", "Bono_Total", "Bono_Final"))
-    tot3 = _fila_total(f"Total ({n})", Pct_Exentas=(ex_aud / pvp) if pvp else 0.0,
-                       Desc_Exentas=((ex_aud / pvp) if pvp else 0.0) * factor_desc_exentas,
-                       Valor_Bono=vb, Pct_Bono=(bt / vb) if vb else np.nan, Bono_Total=bt,
-                       Pct_Meta_Adicional=(float((df["Pct_Meta_Adicional"] * df["Valor_Bono"]).sum()) / vb) if vb else 0.0,
-                       Bono_Final=bf, Bono_Si_Cumpliera=float(df["Bono_Si_Cumpliera"].sum()))
-    t3e = x100(pd.concat([t3e, tot3], ignore_index=True),
-               ["Pct_Exentas", "Desc_Exentas", "Pct_Bono", "Pct_Meta_Adicional"]).rename(columns={
-        "Pct_Exentas": "% Exentas", "Desc_Exentas": "DESC EXENTAS", "Valor_Bono": "Valor Bono",
-        "Pct_Bono": "% Bono", "Bono_Total": "BONO TOTAL", "Pct_Meta_Adicional": "% Meta Adicional",
-        "Bono_Final": "BONO FINAL", "Bono_Si_Cumpliera": "Bono si cumpliera meta"})
-
-    # 4. Descomposición del Valor Bono
-    t4 = df[["Ejecutivo", "Liq_Pagos_Base", "Liq_Pagos", "Liq_Anticipos", "Desc_Consol", "Valor_Bono"]].copy()
-    t4["Pct_Pagos"] = np.where(t4["Liq_Pagos_Base"] > 0,
-                               t4["Liq_Pagos"] / t4["Liq_Pagos_Base"].where(t4["Liq_Pagos_Base"] > 0, 1.0), np.nan)
-    base_t = float(t4["Liq_Pagos_Base"].sum())
-    tot4 = _fila_total(f"Total ({n})", Liq_Pagos_Base=base_t, Liq_Pagos=float(t4["Liq_Pagos"].sum()),
-                       Liq_Anticipos=float(t4["Liq_Anticipos"].sum()), Desc_Consol=float(t4["Desc_Consol"].sum()),
-                       Valor_Bono=float(t4["Valor_Bono"].sum()),
-                       Pct_Pagos=(float(t4["Liq_Pagos"].sum()) / base_t) if base_t else np.nan)
-    t4 = x100(pd.concat([t4, tot4], ignore_index=True), ["Pct_Pagos"])
-    t4 = t4[["Ejecutivo", "Liq_Pagos_Base", "Pct_Pagos", "Liq_Pagos", "Liq_Anticipos", "Desc_Consol", "Valor_Bono"]].rename(columns={
-        "Liq_Pagos_Base": "Liq. Pagos base", "Pct_Pagos": "% Bono aplicado a pagos", "Liq_Pagos": "Liq. Pagos",
-        "Liq_Anticipos": "Liq. Anticipos (pool)", "Desc_Consol": "Desc. Consolidados (pool)", "Valor_Bono": "Valor Bono"})
-
-    # Conciliación del pool
-    pool_df = pd.DataFrame([
-        {"Concepto": "Liquidación base de pagos aplicados", "Monto": pool["pagos_base"]},
-        {"Concepto": "Liquidación de pagos con % individual", "Monto": pool["pagos_ponderados"]},
-        {"Concepto": "Liquidación de anticipos del pool", "Monto": pool["anticipos_ponderados"]},
-        {"Concepto": "Descuentos por conciliación consolidada", "Monto": -pool["descuentos"]},
-        {"Concepto": "Valor Bono del pool", "Monto": pool["valor_bono_pool"]},
-        {"Concepto": "Atribuido a ejecutivos", "Monto": pool["atribuido"]},
-        {"Concepto": "Pendiente de atribución", "Monto": pool["pendiente_atribucion"]},
-    ])
-    return {"resumen": t1, "exentas": t2, "liquidacion": t3e, "descomposicion": t4, "pool": pool_df}
-
-
-CFG_EJ = {
-    "resumen": {"Precio Total PVP": cop(), "Meta": cop(), "% Cumplimiento": pct(), "Aplica Bono del": pct(),
-                "PVP faltante para meta": cop(), "Suma de Costo total": cop(), "Suma de Rentabilidad": cop(),
-                "% Rent (Costo)": pct(), "Cédula": st.column_config.TextColumn(width="small")},
-    "exentas": {"Exentas calculadas (SAP)": cop(), "Exentas auditadas (Contabilidad)": cop(), "Diferencia": cop()},
-    "liquidacion": {"% Exentas": pct(), "DESC EXENTAS": pct(), "Valor Bono": cop(), "% Bono": pct(),
-                    "BONO TOTAL": cop(), "% Meta Adicional": pct(), "BONO FINAL": cop(),
-                    "Bono si cumpliera meta": cop()},
-    "descomposicion": {"Liq. Pagos base": cop(), "% Bono aplicado a pagos": pct(), "Liq. Pagos": cop(),
-                       "Liq. Anticipos (pool)": cop(), "Desc. Consolidados (pool)": cop(), "Valor Bono": cop()},
-}
-REN_CONS = {"pago_nro": "Pago Nro", "fecha_recibo": "Fecha Recibo", "nombre_almacen": "Almacén",
-            "nombre_cliente": "Cliente", "pr": "Total Recibo (PR)", "vr_aplicado": "VR Aplicado",
-            "diferencia": "Diferencia", "descuento_liq": "Descuento Liquidación",
-            "n_facturas": "Facturas", "n_aplicaciones": "Aplicaciones"}
-CFG_CONS = {"Fecha Recibo": st.column_config.DateColumn(format="DD/MM/YYYY"),
-            "Almacén": st.column_config.TextColumn(width="medium"),
-            "Cliente": st.column_config.TextColumn(width="large"),
-            "Total Recibo (PR)": cop(), "VR Aplicado": cop(), "Diferencia": cop(),
-            "Descuento Liquidación": cop()}
-
-TAB_EJ = tablas_ejecutivos(df_ej, pool_ej)
-
 REN1 = {"nom_almacen": "Almacén", "Precio_Total_PVP": "Precio Total PVP", "Aplica_Bono_Del": "Aplica Bono del",
-        "Suma_Costo_Total": "Suma de Costo total", "Suma_Rentabilidad": "Suma de Rentabilidad",
-        "Pct_Rent_Costo": "% Rent (Costo)"}
-REN2 = {"nom_almacen": "Almacén", "Suma_Total_Anticipo": "Suma de Total Anticipo",
-        "Suma_Precio_Total_Exentas": "Suma de Precio total exentas", "Total_Exentas": "Total Exentas"}
+        "Suma_Costo_Total": "Suma de Costo total", "Suma_Rentabilidad": "Suma de Rentabilidad", "Pct_Rent_Costo": "% Rent (Costo)"}
 REN3 = {"nom_almacen": "Almacén", "Pct_Exentas": "% Exentas", "Desc_Exentas": "DESC EXENTAS",
         "Valor_Bono": "Valor Bono", "Pct_Bono": "% Bono", "Bono_Total": "BONO TOTAL",
         "Pct_Meta_Adicional": "% Meta Adicional", "Bono_Final": "BONO FINAL"}
-REN4 = {"nom_almacen": "Almacén", "pagos_liq": "Liq. Pagos", "ant_liq": "Liq. Anticipos",
-        "desc_liq": "Desc. Consolidados", "Valor_Bono": "Valor Bono"}
-COLS3 = ["Almacén", "% Exentas", "DESC EXENTAS", "Valor Bono", "% Bono", "BONO TOTAL", "% Meta Adicional", "BONO FINAL"]
 
 
-def frames_almacenes() -> dict:
-    if dff.empty:
-        return {}
-    t3_show = x100(pd.concat([t3, fila_total3], ignore_index=True),
-                   ["Pct_Exentas", "Desc_Exentas", "Pct_Bono", "Pct_Meta_Adicional"])
-    return {
-        "resumen": pd.concat([tabla1, fila_total1], ignore_index=True).rename(columns=REN1),
-        "exentas": pd.concat([tabla2, fila_total2], ignore_index=True).rename(columns=REN2),
-        "liquidacion": t3_show.rename(columns=REN3)[COLS3],
-        "descomposicion": descomp.rename(columns=REN4),
-        "consolidados": (pd.concat([tabla_cons, fila_total_cons], ignore_index=True).rename(columns=REN_CONS)
-                         if not tabla_cons.empty else pd.DataFrame()),
-    }
-
-
-FR_ALM = frames_almacenes()
-
-CFG_ALM = {
-    "resumen": {"Precio Total PVP": cop(), "Aplica Bono del": pct(), "Suma de Costo total": cop(),
-                "Suma de Rentabilidad": cop(), "% Rent (Costo)": pct()},
-    "exentas": {"Suma de Total Anticipo": cop(), "Suma de Precio total exentas": cop(), "Total Exentas": cop()},
-    "liquidacion": {"% Exentas": pct(), "DESC EXENTAS": pct(), "Valor Bono": cop(), "% Bono": pct(),
-                    "BONO TOTAL": cop(), "% Meta Adicional": pct(), "BONO FINAL": cop()},
-    "descomposicion": {"Liq. Pagos": cop(), "Liq. Anticipos": cop(), "Desc. Consolidados": cop(), "Valor Bono": cop()},
-}
-
-
-# ============================================================
-# INFORME COMPLETO (Excel)
-# ============================================================
-def _hoja(xw, df, nombre, vacio):
-    (df if df is not None and not df.empty else pd.DataFrame({"Nota": [vacio]})).to_excel(
-        xw, index=False, sheet_name=nombre)
+def _pct100(df):
+    df = df.copy()
+    for col in ["Pct_Exentas", "Desc_Exentas", "Pct_Bono", "Pct_Meta_Adicional"]:
+        if col in df.columns:
+            df[col] = df[col] * 100.0
+    return df
 
 
 def construir_informe_excel() -> bytes:
     buf = io.BytesIO()
+    t3_exp = _pct100(pd.concat([t3, fila_total3], ignore_index=True)) if not t3.empty else t3
     with pd.ExcelWriter(buf, engine="openpyxl") as xw:
-        _hoja(xw, FR_ALM.get("resumen"), "1. Resumen Almacén", "Sin datos de almacenes en el mes")
-        _hoja(xw, FR_ALM.get("exentas"), "2. Anticipos y Exentas", "Sin datos")
-        _hoja(xw, FR_ALM.get("liquidacion"), "3. Liquidación Almacén", "Sin datos")
-        _hoja(xw, FR_ALM.get("descomposicion"), "4. Descomposición Almacén", "Sin datos")
-        _hoja(xw, FR_ALM.get("consolidados"), "5. Consolidados Almacén", "Sin pagos consolidados observados")
-        _hoja(xw, TAB_EJ.get("resumen"), "6. Resumen Ejecutivos", "Sin ventas de ejecutivos en el mes")
-        _hoja(xw, TAB_EJ.get("exentas"), "7. Exentas Ejecutivos", "Sin datos")
-        _hoja(xw, TAB_EJ.get("liquidacion"), "8. Liquidación Ejecutivos", "Sin datos")
-        _hoja(xw, TAB_EJ.get("descomposicion"), "9. Descomp. Ejecutivos", "Sin datos")
-        _hoja(xw, TAB_EJ.get("pool"), "10. Pool Ejecutivos", "Sin datos")
-        _hoja(xw, (pd.concat([tabla_cons_ej, fila_total_cons_ej], ignore_index=True).rename(columns=REN_CONS)
-                   if not tabla_cons_ej.empty else None),
-              "11. Consolidados Ejecutivos", "Sin pagos consolidados observados")
+        (pd.concat([tabla1, fila_total1], ignore_index=True).rename(columns=REN1)
+         if not tabla1.empty else pd.DataFrame({"Nota": ["Sin datos de almacenes en el mes"]})).to_excel(
+            xw, index=False, sheet_name="1. Resumen Almacén")
+        (pd.concat([tabla2, fila_total2], ignore_index=True).rename(columns={
+            "nom_almacen": "Almacén", "Suma_Total_Anticipo": "Suma de Total Anticipo",
+            "Suma_Precio_Total_Exentas": "Suma de Precio total exentas", "Total_Exentas": "Total Exentas"})
+         if not tabla2.empty else pd.DataFrame({"Nota": ["Sin datos"]})).to_excel(
+            xw, index=False, sheet_name="2. Anticipos y Exentas")
+        (t3_exp.rename(columns=REN3) if not t3_exp.empty else pd.DataFrame({"Nota": ["Sin datos"]})).to_excel(
+            xw, index=False, sheet_name="3. Liquidación Almacén")
+        (pd.concat([tabla_cons, fila_total_cons], ignore_index=True).rename(columns={
+            "pago_nro": "Pago Nro", "fecha_recibo": "Fecha Recibo", "nombre_almacen": "Almacén",
+            "nombre_cliente": "Cliente", "pr": "Total Recibo (PR)", "vr_aplicado": "VR Aplicado",
+            "diferencia": "Diferencia", "descuento_liq": "Descuento Liquidación",
+            "n_facturas": "Facturas", "n_aplicaciones": "Aplicaciones"})
+         if not tabla_cons.empty else pd.DataFrame({"Nota": ["Sin pagos consolidados observados"]})).to_excel(
+            xw, index=False, sheet_name="4. Control Consolidados")
+        (descomp.rename(columns={"nom_almacen": "Almacén", "pagos_liq": "Liq. Pagos", "ant_liq": "Liq. Anticipos",
+                                 "desc_liq": "Desc. Consolidados", "Valor_Bono": "Valor Bono"})
+         if not descomp.empty else pd.DataFrame({"Nota": ["Sin datos"]})).to_excel(
+            xw, index=False, sheet_name="5. Descomposición Valor Bono")
+        df_ej_exp = df_ejec.copy()
+        if not df_ej_exp.empty:
+            if abs(no_atribuido) > 1.0:
+                df_ej_exp = pd.concat([df_ej_exp, pd.DataFrame([{
+                    "Ejecutivo": "Pendiente de atribución (sin vendedor coincidente)", "Cédula": "",
+                    "PVP": 0.0, "Meta": 0.0, "% Cumplimiento": 0.0, "Cumple_Meta": False,
+                    "PVP_faltante": np.nan, "% Rent (Costo)": np.nan, "% Bono": np.nan,
+                    "Valor_Bono": no_atribuido, "Bono_Total": 0.0, "Bono_si_cumpliera": np.nan,
+                    "% Meta_Adic": 0.0, "Bono_Final": 0.0, "Exentas_Auditadas": 0.0}])], ignore_index=True)
+            df_ej_exp = pd.concat([df_ej_exp, pd.DataFrame([{
+                "Ejecutivo": f"Total ({len(df_ejec)} ejecutivos)", "Cédula": "",
+                "PVP": df_ejec["PVP"].sum(), "Meta": META_EJECUTIVO_MENSUAL * len(df_ejec),
+                "% Cumplimiento": df_ejec["PVP"].sum() / (META_EJECUTIVO_MENSUAL * len(df_ejec)) * 100.0,
+                "Cumple_Meta": n_cumplen, "PVP_faltante": df_ejec["PVP_faltante"].sum(),
+                "% Rent (Costo)": np.nan, "% Bono": np.nan,
+                "Valor_Bono": df_ejec["Valor_Bono"].sum(), "Bono_Total": df_ejec["Bono_Total"].sum(),
+                "Bono_si_cumpliera": df_ejec["Bono_si_cumpliera"].sum(), "% Meta_Adic": np.nan,
+                "Bono_Final": bf_ejec, "Exentas_Auditadas": df_ejec["Exentas_Auditadas"].sum()}])], ignore_index=True)
+        df_ej_exp = df_ej_exp.drop(columns=["Liq_Pagos", "Exentas_SAP", "Decision_Cont"], errors="ignore")
+        (df_ej_exp.rename(columns={
+            "Cumple_Meta": "Cumple Meta", "PVP_faltante": "PVP faltante p/ meta",
+            "Valor_Bono": "Valor Bono", "Bono_Total": "BONO TOTAL",
+            "Bono_si_cumpliera": "Bono si cumpliera", "% Meta_Adic": "% Meta Adicional",
+            "Bono_Final": "BONO FINAL", "Exentas_Auditadas": "Exentas Auditadas ($)"})
+         if not df_ej_exp.empty else pd.DataFrame({"Nota": ["Sin ventas de ejecutivos en el mes"]})).to_excel(
+            xw, index=False, sheet_name="6. Ejecutivos Individual")
     return buf.getvalue()
 
 
-# ============================================================
-# ENCABEZADO
-# ============================================================
-st.title("Conciliación Bono")
-h1, h2 = st.columns([5, 1])
-with h1:
-    st.caption(md(
-        f"Período evaluado: {fmt_mes(mes_sel)}  |  Metas almacenes: {periodo_metas['nombre']}  |  "
-        f"Escala almacenes: {periodo_escala['nombre']}  |  Metas ejecutivos: {fuente_meta_ej}  |  "
-        f"Escala ejecutivos: {fuente_escala_ej}  |  Factor DESC exentas: {factor_desc_exentas * 100:.0f}%"))
-with h2:
-    st.download_button("Descargar informe (Excel)", data=construir_informe_excel(),
+hdr_t, hdr_b = st.columns([5, 1])
+with hdr_b:
+    st.download_button("Descargar informe completo (Excel)",
+                       data=construir_informe_excel(),
                        file_name=f"informe_conciliacion_bono_{periodo_mes_str}.xlsx",
                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                        use_container_width=True)
+with hdr_t:
+    st.caption(f"Período evaluado: {mes_sel.strftime('%B %Y')} · Período de metas: {periodo_metas['nombre']} · "
+               f"Período de escala: {periodo_escala['nombre']} · Factor DESC exentas: {factor_desc_exentas * 100:.0f}%")
 
 tab_alm, tab_ej = st.tabs(["Almacenes", "Ejecutivos Comerciales"])
 
 # ------------------------------------------------------------
-# PESTAÑA: ALMACENES
+# PESTAÑA 1: ALMACENES
 # ------------------------------------------------------------
 with tab_alm:
-    if not FR_ALM:
-        st.info("Sin datos de almacenes en el mes y filtros seleccionados.")
+    kpi_almacenes = st.container()
+    if dff.empty:
+        st.info("Sin datos de almacenes en el mes y filtros seleccionados "
+                "(EJECOM se audita en su propia pestaña).")
     else:
-        n_alm = len(t3)
-        n_con_bono = int((t3["aplica"] != 0).sum())
-        tarjetas([
-            ("PVP del mes", fmt_cop(tp), f"{n_alm} almacenes"),
-            ("Almacenes con bono", f"{n_con_bono} de {n_alm}", "Meta de ventas alcanzada"),
-            ("Valor Bono", fmt_cop(tv), "Pagos + anticipos - consolidados"),
-            ("BONO TOTAL", fmt_cop(bt_sum), "Tras escala de rentabilidad"),
-            ("BONO FINAL", fmt_cop(bf_sum), "Tras meta de ventas y adicional"),
-            ("% Exentas", fmt_pct(te / tp if tp else 0.0, 2), f"DESC EXENTAS {fmt_pct((te / tp if tp else 0.0) * factor_desc_exentas, 2)}"),
-        ])
+        # ---- KPIs y conciliación del pool de almacenes (arriba de las tablas) ----
+        pvp_red = float(t3["Precio_Total_PVP"].sum())
+        n_alms = len(t3)
+        n_aplican = int((t3["aplica"] != 0).sum())
+        vb_red = float(t3["Valor_Bono"].sum())
+        bt_red = float(t3["Bono_Total"].sum())
+        bf_red = float(t3["Bono_Final"].sum())
+        pagos_red = float(t3["pagos_liq"].sum())
+        ants_red = float(t3["ant_liq"].sum())
+        desc_red = float(t3["desc_liq"].sum())
+        k = st.columns(5)
+        with k[0].container(border=True, height=92):
+            st.metric("PVP red del mes", f"${pvp_red:,.0f}")
+        with k[1].container(border=True, height=92):
+            st.metric("Almacenes con bono", f"{n_aplican} de {n_alms}",
+                      help="Almacenes cuyo PVP cayó en un tramo con % aplicable distinto de 0")
+        with k[2].container(border=True, height=92):
+            st.metric("Valor Bono (pool)", f"${vb_red:,.2f}",
+                      help="Pagos aplicados + anticipos − descuentos consolidados de los almacenes")
+        with k[3].container(border=True, height=92):
+            st.metric("Bono Total (escala)", f"${bt_red:,.2f}",
+                      help="Valor Bono × % de la escala de rentabilidad de cada almacén")
+        with k[4].container(border=True, height=92):
+            st.metric("BONO FINAL red", f"${bf_red:,.2f}",
+                      help="Bono Total × (1 + % meta adicional) en los almacenes que aplican")
+        with st.container(border=True):
+            st.markdown("**Conciliación del pool de almacenes**")
+            st.dataframe(pd.DataFrame([
+                {"Concepto": "Liquidación de pagos aplicados", "Monto": pagos_red},
+                {"Concepto": "Liquidación de anticipos", "Monto": ants_red},
+                {"Concepto": "Descuentos por conciliación consolidada", "Monto": -desc_red},
+                {"Concepto": "Valor Bono del pool", "Monto": vb_red},
+                {"Concepto": "Verificación (debe ser $0.00)",
+                 "Monto": pagos_red + ants_red - desc_red - vb_red},
+            ]), use_container_width=True, hide_index=True,
+                column_config={"Monto": st.column_config.NumberColumn(format="$%,.2f")})
+            st.caption("El Valor Bono de cada almacén nace de la misma fuente única "
+                       "(calcular_distribucion_bono_almacen, compartida con Detalle Bono): la fila de "
+                       "verificación debe dar siempre $0.00. Si algún día no, hay un descuadre entre módulos.")
+        st.markdown("---")
+        st.subheader("1. Resumen por Almacén (tramos de meta)")
+        st.dataframe(
+            pd.concat([tabla1, fila_total1], ignore_index=True).rename(columns=REN1),
+            use_container_width=True, hide_index=True,
+            column_config={
+                "Precio Total PVP": st.column_config.NumberColumn(format="$%,.2f"),
+                "Aplica Bono del": st.column_config.NumberColumn(format="%.2f%%"),
+                "Suma de Costo total": st.column_config.NumberColumn(format="$%,.2f"),
+                "Suma de Rentabilidad": st.column_config.NumberColumn(format="$%,.2f"),
+                "% Rent (Costo)": st.column_config.NumberColumn(format="%.2f%%")})
 
-        st.subheader("1. Resumen por almacén (tramos de meta)")
-        tabla(FR_ALM["resumen"], CFG_ALM["resumen"])
+        st.markdown("---")
+        st.subheader("2. Anticipos y Exentas por Almacén")
+        st.dataframe(
+            pd.concat([tabla2, fila_total2], ignore_index=True).rename(columns={
+                "nom_almacen": "Almacén", "Suma_Total_Anticipo": "Suma de Total Anticipo",
+                "Suma_Precio_Total_Exentas": "Suma de Precio total exentas", "Total_Exentas": "Total Exentas"}),
+            use_container_width=True, hide_index=True,
+            column_config={
+                "Suma de Total Anticipo": st.column_config.NumberColumn(format="$%,.2f"),
+                "Suma de Precio total exentas": st.column_config.NumberColumn(format="$%,.2f"),
+                "Total Exentas": st.column_config.NumberColumn(format="$%,.2f")})
 
-        st.subheader("2. Anticipos y exentas por almacén")
-        tabla(FR_ALM["exentas"], CFG_ALM["exentas"])
-
-        st.subheader("3. Liquidación del bono por almacén")
+        st.markdown("---")
+        st.subheader("3. Liquidación del Bono por Almacén")
         st.caption("La fila Total suma las filas: los tramos de meta se evalúan por almacén.")
-        tabla(FR_ALM["liquidacion"], CFG_ALM["liquidacion"])
+        t3_mostrar = _pct100(pd.concat([t3, fila_total3], ignore_index=True))
+        st.dataframe(
+            t3_mostrar.rename(columns=REN3)[
+                ["Almacén", "% Exentas", "DESC EXENTAS", "Valor Bono", "% Bono",
+                 "BONO TOTAL", "% Meta Adicional", "BONO FINAL"]],
+            use_container_width=True, hide_index=True,
+            column_config={
+                "% Exentas": st.column_config.NumberColumn(format="%.2f%%"),
+                "DESC EXENTAS": st.column_config.NumberColumn(format="%.2f%%"),
+                "Valor Bono": st.column_config.NumberColumn(format="$%,.2f"),
+                "% Bono": st.column_config.NumberColumn(format="%.2f%%"),
+                "BONO TOTAL": st.column_config.NumberColumn(format="$%,.2f"),
+                "% Meta Adicional": st.column_config.NumberColumn(format="%.2f%%"),
+                "BONO FINAL": st.column_config.NumberColumn(format="$%,.2f")})
+        with st.expander("Descomposición del Valor Bono por almacén"):
+            st.dataframe(
+                descomp.rename(columns={"nom_almacen": "Almacén", "pagos_liq": "Liq. Pagos",
+                                        "ant_liq": "Liq. Anticipos", "desc_liq": "Desc. Consolidados",
+                                        "Valor_Bono": "Valor Bono"}),
+                use_container_width=True, hide_index=True,
+                column_config={
+                    "Liq. Pagos": st.column_config.NumberColumn(format="$%,.2f"),
+                    "Liq. Anticipos": st.column_config.NumberColumn(format="$%,.2f"),
+                    "Desc. Consolidados": st.column_config.NumberColumn(format="$%,.2f"),
+                    "Valor Bono": st.column_config.NumberColumn(format="$%,.2f")})
 
-        st.subheader("4. Descomposición del Valor Bono")
-        tabla(FR_ALM["descomposicion"], CFG_ALM["descomposicion"])
-
-        st.subheader("5. Control: pagos en conciliación consolidada")
-        st.caption(md("Recibos cuya suma aplicada supera el valor del recibo (conciliaciones con N pagos y M facturas). "
-                      "Regla: diferencia mayor a $100. Respeta los filtros de mes y almacén."))
-        if FR_ALM["consolidados"].empty:
+        st.markdown("---")
+        st.subheader("4. Control: pagos en conciliación consolidada")
+        st.caption("Recibos cuya suma aplicada supera el valor del recibo (conciliaciones con N pagos y M facturas). "
+                   "Regla: diferencia mayor a $100. Respeta los filtros de mes y almacén.")
+        if tabla_cons.empty:
             st.info("Sin pagos consolidados observados en el mes y almacenes seleccionados.")
         else:
-            tabla(FR_ALM["consolidados"], CFG_CONS)
+            st.dataframe(
+                pd.concat([tabla_cons, fila_total_cons], ignore_index=True).rename(columns={
+                    "pago_nro": "Pago Nro", "fecha_recibo": "Fecha Recibo", "nombre_almacen": "Almacén",
+                    "nombre_cliente": "Cliente", "pr": "Total Recibo (PR)", "vr_aplicado": "VR Aplicado",
+                    "diferencia": "Diferencia", "descuento_liq": "Descuento Liquidación",
+                    "n_facturas": "Facturas", "n_aplicaciones": "Aplicaciones"}),
+                use_container_width=True, hide_index=True,
+                column_config={
+                    "Fecha Recibo": st.column_config.DateColumn(format="DD/MM/YYYY"),
+                    "Almacén": st.column_config.TextColumn(width="medium"),
+                    "Cliente": st.column_config.TextColumn(width="large"),
+                    "Total Recibo (PR)": st.column_config.NumberColumn(format="$%,.2f"),
+                    "VR Aplicado": st.column_config.NumberColumn(format="$%,.2f"),
+                    "Diferencia": st.column_config.NumberColumn(format="$%,.2f"),
+                    "Descuento Liquidación": st.column_config.NumberColumn(format="$%,.2f")})
 
 # ------------------------------------------------------------
-# PESTAÑA: EJECUTIVOS COMERCIALES
+# PESTAÑA 2: EJECUTIVOS COMERCIALES
 # ------------------------------------------------------------
+#with tab_ej:
+#    st.subheader(f"Ejecutivos Comerciales · Evaluación individual · {mes_sel.strftime('%B %Y')}")
+
+#    with st.container(border=True):
+#        st.markdown("**Cómo se calcula**")
+#        c1, c2, c3 = st.columns(3)
+#        c1.caption(f"**1. Meta individual.** Cada ejecutivo aplica al 100% solo si su PVP del mes es "
+#                   f"≥ ${META_EJECUTIVO_MENSUAL:,.0f}. La meta se configura en Variables del Bono (ámbito Ejecutivos).")
+#        c2.caption("**2. Si cumple.** Entra a la misma cadena que un almacén: escala de rentabilidad sobre su "
+#                   "propia rentabilidad y Valor Bono proporcional a sus pagos aplicados en el mes.")
+#        c3.caption("**3. Si no cumple.** Su Bono Final del mes es $0. Las columnas *PVP faltante* y "
+#                   "*Bono si cumpliera* muestran la distancia y el impacto.")
+
 with tab_ej:
-    if df_ej.empty:
-        st.info("Sin ventas ni pagos de ejecutivos comerciales en el mes seleccionado.")
+    st.subheader(f"Ejecutivos Comerciales · Evaluación individual · {mes_sel.strftime('%B %Y')}")
+
+    # ---- Marco de regla + KPIs generales ----
+#    with st.container(border=True):
+#        st.markdown("**Cómo se calcula**")
+#        c1, c2, c3 = st.columns(3)
+#        c1.caption(f"**1. Meta individual.** Cada ejecutivo aplica al 100% solo si su PVP del mes es "
+#                   f"≥ ${META_EJECUTIVO_MENSUAL:,.0f} (configurable en Variables del Bono).")
+#        c2.caption("**2. Si cumple.** Misma cadena que un almacén: escala de rentabilidad sobre su propia "
+#                   "rentabilidad y Valor Bono proporcional a sus pagos aplicados.")
+#        c3.caption("**3. Si no cumple.** Su Bono Final del mes es $0. Las columnas *PVP faltante* y "
+#                   "*Bono si cumpliera* muestran la distancia y el impacto.")
+    pvp_ej_tot = float(df_ventas_ej["pvp"].sum()) if not df_ventas_ej.empty else 0.0
+    k = st.columns(5)
+    with k[0].container(border=True, height=92):
+        st.metric("PVP EJECOM del mes", f"${pvp_ej_tot:,.0f}")
+    with k[1].container(border=True, height=92):
+        st.metric("Cumplen meta", f"{n_cumplen} de {len(df_ejec)}")
+    with k[2].container(border=True, height=92):
+        st.metric("Valor Bono (pool)", f"${pool_valor:,.2f}",
+                  help="Pagos aplicados + anticipos − descuentos consolidados de la serie EJECOM")
+    with k[3].container(border=True, height=92):
+        st.metric("Atribuido a ejecutivos", f"${atribuido:,.2f}")
+    with k[4].container(border=True, height=92):
+        st.metric("Bono Final ejecutivos", f"${bf_ejec:,.2f}")
+
+    if df_ejec.empty:
+        st.info("Sin ventas de ejecutivos comerciales en el mes seleccionado.")
     else:
-        n_ej = int(df_ej["Meta"].notna().sum())     # excluye la fila Sin Vendedor
-        n_cumplen = int(df_ej["Cumple"].sum())
-        pvp_ej = float(df_ej["PVP"].sum())
-        vb_ej = float(df_ej["Valor_Bono"].sum())
-        bt_ej = float(df_ej["Bono_Total"].sum())
-        bf_ej = float(df_ej["Bono_Final"].sum())
-        meta_ej = float(pool_ej["meta"])
-        sin_derecho = float(df_ej.loc[~df_ej["Cumple"] & df_ej["Meta"].notna(), "Bono_Si_Cumpliera"].sum())
+        # ============================================================
+        # 1. RESUMEN POR EJECUTIVO (META INDIVIDUAL)
+        # ============================================================
+        st.markdown("---")
+        st.subheader("1. Resumen por Ejecutivo (meta individual)")
+        t1_ej = df_ejec[["Ejecutivo", "Cédula", "PVP", "Meta", "% Cumplimiento", "Cumple_Meta",
+                         "PVP_faltante", "% Rent (Costo)", "% Bono"]].copy()
+        fila_t1 = pd.DataFrame([{
+            "Ejecutivo": f"Total ({len(df_ejec)} ejecutivos)", "Cédula": "",
+            "PVP": t1_ej["PVP"].sum(), "Meta": META_EJECUTIVO_MENSUAL * len(df_ejec),
+            "% Cumplimiento": t1_ej["PVP"].sum() / (META_EJECUTIVO_MENSUAL * len(df_ejec)) * 100.0,
+            "Cumple_Meta": n_cumplen, "PVP_faltante": t1_ej["PVP_faltante"].sum(),
+            "% Rent (Costo)": np.nan, "% Bono": np.nan}])
+        st.dataframe(
+            pd.concat([t1_ej, fila_t1], ignore_index=True).rename(columns={
+                "Cumple_Meta": "¿Cumple Meta?", "PVP_faltante": "PVP faltante",
+                "% Rent (Costo)": "% Rent (Costo)", "% Bono": "% Bono (escala)"}),
+            use_container_width=True, hide_index=True,
+            column_config={
+                "Ejecutivo": st.column_config.TextColumn(width="medium"),
+                "Cédula": st.column_config.TextColumn(width="small"),
+                "PVP": st.column_config.NumberColumn(format="$%,.2f"),
+                "Meta": st.column_config.NumberColumn(format="$%,.0f"),
+                "% Cumplimiento": st.column_config.NumberColumn(format="%.2f%%"),
+                "¿Cumple Meta?": st.column_config.CheckboxColumn(),
+                "PVP faltante": st.column_config.NumberColumn(format="$%,.2f"),
+                "% Rent (Costo)": st.column_config.NumberColumn(format="%.2f%%"),
+                "% Bono (escala)": st.column_config.NumberColumn(format="%.2f%%")})
+        st.caption("La meta se evalúa por ejecutivo, no sobre el agregado EJECOM: cumple → aplica al 100%; "
+                   "no cumple → Bono Final $0. Aquí no aplican los tramos de almacén.")
 
-        tarjetas([
-            ("PVP del mes", fmt_cop(pvp_ej), f"{n_ej} ejecutivos"),
-            ("Cumplen meta", f"{n_cumplen} de {n_ej}", f"Meta individual {fmt_cop(meta_ej)}"),
-            ("Valor Bono", fmt_cop(vb_ej), "Pagos + anticipos - consolidados"),
-            ("BONO TOTAL", fmt_cop(bt_ej), "Tras escala de rentabilidad"),
-            ("BONO FINAL", fmt_cop(bf_ej), "Ejecutivos que cumplen meta"),
-            ("Sin derecho por meta", fmt_cop(sin_derecho), "Bono que habrían recibido al cumplir"),
+        # ============================================================
+        # 2. ANTICIPOS Y EXENTAS POR EJECUTIVO
+        # ============================================================
+        st.markdown("---")
+        st.subheader("2. Anticipos y Exentas por Ejecutivo")
+        t2_ej = df_ejec[["Ejecutivo", "Cédula", "PVP", "Exentas_SAP", "Decision_Cont", "Exentas_Auditadas"]].copy()
+        t2_ej["Decision_Cont"] = pd.to_numeric(t2_ej["Decision_Cont"], errors="coerce")
+        t2_ej["% Exentas"] = np.where(t2_ej["PVP"] != 0, t2_ej["Exentas_Auditadas"] / t2_ej["PVP"], 0.0)
+        fila_t2 = pd.DataFrame([{
+            "Ejecutivo": "Total", "Cédula": "", "PVP": t2_ej["PVP"].sum(),
+            "Exentas_SAP": t2_ej["Exentas_SAP"].sum(), "Decision_Cont": np.nan,
+            "Exentas_Auditadas": t2_ej["Exentas_Auditadas"].sum(),
+            "% Exentas": (t2_ej["Exentas_Auditadas"].sum() / t2_ej["PVP"].sum()) if t2_ej["PVP"].sum() else 0.0}])
+        st.dataframe(
+            pd.concat([t2_ej, fila_t2], ignore_index=True).rename(columns={
+                "Exentas_SAP": "Total Exentas (SAP)", "Decision_Cont": "Corrección Contabilidad ($)",
+                "Exentas_Auditadas": "Exentas finales auditadas", "% Exentas": "% Exentas"}),
+            use_container_width=True, hide_index=True,
+            column_config={
+                "Ejecutivo": st.column_config.TextColumn(width="medium"),
+                "Cédula": st.column_config.TextColumn(width="small"),
+                "PVP": st.column_config.NumberColumn(format="$%,.2f"),
+                "Total Exentas (SAP)": st.column_config.NumberColumn(format="$%,.2f"),
+                "Corrección Contabilidad ($)": st.column_config.NumberColumn(format="$%,.2f"),
+                "Exentas finales auditadas": st.column_config.NumberColumn(format="$%,.2f"),
+                "% Exentas": st.column_config.NumberColumn(format="%.2f%%")})
+        st.caption("Si Contabilidad registró una decisión *corregida* (módulo Auditoría Exentas), ese valor en pesos "
+                   "reemplaza el calculado de SAP. Los anticipos de EJECOM no traen vendedor en el recibo SAP: "
+                   "no se atribuyen por ejecutivo; entran al pool que se reparte en la sección 3.")
+
+        # ============================================================
+        # 3. LIQUIDACIÓN DEL BONO POR EJECUTIVO
+        # ============================================================
+        st.markdown("---")
+        st.subheader("3. Liquidación del Bono por Ejecutivo")
+        t3_ej = df_ejec[["Ejecutivo", "Liq_Pagos", "Valor_Bono", "% Bono", "Bono_Total",
+                         "Cumple_Meta", "Bono_Final"]].copy()
+        fila_t3 = pd.DataFrame([{
+            "Ejecutivo": "Total", "Liq_Pagos": t3_ej["Liq_Pagos"].sum(),
+            "Valor_Bono": t3_ej["Valor_Bono"].sum(), "% Bono": np.nan,
+            "Bono_Total": t3_ej["Bono_Total"].sum(), "Cumple_Meta": n_cumplen,
+            "Bono_Final": t3_ej["Bono_Final"].sum()}])
+        st.dataframe(
+            pd.concat([t3_ej, fila_t3], ignore_index=True).rename(columns={
+                "Liq_Pagos": "Liq. Pagos (propia)", "Valor_Bono": "Valor Bono (atribuido)",
+                "% Bono": "% Bono", "Bono_Total": "BONO TOTAL",
+                "Cumple_Meta": "¿Cumple Meta?", "Bono_Final": "BONO FINAL"}),
+            use_container_width=True, hide_index=True,
+            column_config={
+                "Ejecutivo": st.column_config.TextColumn(width="medium"),
+                "Liq. Pagos (propia)": st.column_config.NumberColumn(format="$%,.2f"),
+                "Valor Bono (atribuido)": st.column_config.NumberColumn(format="$%,.2f"),
+                "% Bono": st.column_config.NumberColumn(format="%.2f%%"),
+                "BONO TOTAL": st.column_config.NumberColumn(format="$%,.2f"),
+                "¿Cumple Meta?": st.column_config.CheckboxColumn(),
+                "BONO FINAL": st.column_config.NumberColumn(format="$%,.2f")})
+        with st.expander("Descomposición del Valor Bono por Ejecutivo (del pool a cada uno)"):
+            st.dataframe(pd.DataFrame([{
+                "Liq. Pagos": pool_pagos, "Liq. Anticipos": pool_ants,
+                "Desc. Consolidados": -pool_desc, "Valor Bono (pool)": pool_valor,
+                "Factor de atribución": factor_pool}]),
+                use_container_width=True, hide_index=True,
+                column_config={
+                    "Liq. Pagos": st.column_config.NumberColumn(format="$%,.2f"),
+                    "Liq. Anticipos": st.column_config.NumberColumn(format="$%,.2f"),
+                    "Desc. Consolidados": st.column_config.NumberColumn(format="$%,.2f"),
+                    "Valor Bono (pool)": st.column_config.NumberColumn(format="$%,.2f"),
+                    "Factor de atribución": st.column_config.NumberColumn(format="%.6f")})
+            st.caption(f"Valor Bono atribuido = liquidación de pagos propia × factor de atribución "
+                       f"({factor_pool:.6f}). El factor repone anticipos y descuentos consolidados de forma "
+                       "proporcional, para que la suma de lo atribuido cuadre con el pool.")
+            st.dataframe(
+                df_ejec[["Ejecutivo", "Liq_Pagos", "Valor_Bono"]].rename(columns={
+                    "Liq_Pagos": "Liq. Pagos", "Valor_Bono": "Valor Bono atribuido (= liq × factor)"}),
+                use_container_width=True, hide_index=True,
+                column_config={
+                    "Liq. Pagos": st.column_config.NumberColumn(format="$%,.2f"),
+                    "Valor Bono atribuido (= liq × factor)": st.column_config.NumberColumn(format="$%,.2f")})
+
+        # ============================================================
+        # 4. CONTROL DE CUADRE EJECOM
+        # ============================================================
+        st.markdown("---")
+        st.subheader("4. Control de cuadre EJECOM")
+        df_cuadre = pd.DataFrame([
+            {"Concepto": "Valor Bono del pool (pagos + anticipos − consolidados)", "Monto": pool_valor},
+            {"Concepto": "(−) Atribuido a ejecutivos por sus pagos", "Monto": -atribuido},
+            {"Concepto": "(=) Pendiente de atribución (sin vendedor coincidente)", "Monto": no_atribuido},
+            {"Concepto": "Verificación (debe ser $0.00)", "Monto": pool_valor - atribuido - no_atribuido},
         ])
-
-        if abs(pool_ej["pendiente_atribucion"]) > TOL_CUADRE:
-            st.warning(
-                md(f"Pendiente de atribución: {fmt_cop(pool_ej['pendiente_atribucion'])}. Existen anticipos o descuentos "
-                   "consolidados de EJECOM sin pagos aplicados en el mes que permitan repartirlos entre ejecutivos."))
-        if (df_ej["Ejecutivo"] == "Sin Vendedor").any():
-            st.warning("Existen pagos o ventas sin vendedor asignado en SAP. Revise la fila Sin Vendedor.")
-
-        st.subheader("1. Resumen por ejecutivo (meta individual)")
-        st.caption(md(f"Meta individual vigente: {fmt_cop(meta_ej)} de PVP mensual. "
-                      f"Cumplen: {n_cumplen} de {n_ej}."))
-        tabla(TAB_EJ["resumen"], CFG_EJ["resumen"])
-
-        st.subheader("2. Exentas por ejecutivo")
-        st.caption("Valor auditado por Contabilidad cuando existe corrección; en otro caso, el valor calculado desde SAP.")
-        tabla(TAB_EJ["exentas"], CFG_EJ["exentas"])
-
-        st.subheader("3. Liquidación del bono por ejecutivo")
-        st.caption("Mismo esquema que almacenes. BONO FINAL es cero cuando el ejecutivo no alcanza la meta del mes; "
-                   "la última columna muestra el bono que habría recibido al cumplirla.")
-        tabla(TAB_EJ["liquidacion"], CFG_EJ["liquidacion"])
-
-        st.subheader("4. Descomposición del Valor Bono")
-        tabla(TAB_EJ["descomposicion"], CFG_EJ["descomposicion"])
-        with st.expander("Conciliación del pool EJECOM"):
-            tabla(TAB_EJ["pool"], {"Monto": cop()})
-            if abs(pool_ej["pendiente_atribucion"]) <= TOL_CUADRE:
-                st.caption("El Valor Bono del pool está atribuido en su totalidad a ejecutivos.")
-
-        st.subheader("5. Control: pagos en conciliación consolidada")
-        st.caption(md("Recibos de series EJECOM cuya suma aplicada supera el valor del recibo. Regla: diferencia mayor a $100."))
-        if tabla_cons_ej.empty:
-            st.info("Sin pagos consolidados observados para EJECOM en el mes.")
+        st.dataframe(df_cuadre, use_container_width=True, hide_index=True,
+                     column_config={"Monto": st.column_config.NumberColumn(format="$%,.2f")})
+        if abs(no_atribuido) > 1.0:
+            st.caption(f"Quedan ${no_atribuido:,.2f} sin atribuir: cobros sin vendedor coincidente (grafías "
+                       "distintas entre ventas y pagos, pagos sin vendedor o pagos sin ventas en el mes). Su bono "
+                       "es $0 hasta atribuirlos con el vínculo SAP ↔ Talento Humano; no afectan a los demás.")
         else:
-            tabla(pd.concat([tabla_cons_ej, fila_total_cons_ej], ignore_index=True).rename(columns=REN_CONS), CFG_CONS)
+            st.caption("Pool completamente atribuido: cada peso del Valor Bono EJECOM tiene ejecutivo responsable.")
 
-        with st.expander("Criterios de cálculo"):
-            st.markdown(md(
-                f"""
-- **Meta individual.** Se toma de los tramos de metas del ámbito Ejecutivos en Variables del Bono
-  ({fuente_meta_ej}). Hoy: 0 % por debajo de {fmt_cop(meta_ej)} y 100 % desde esa cifra.
-- **Valor Bono.** Cada pago aplicado en el mes liquida sobre su base y se pondera con el % del tramo que el
-  ejecutivo alcanzó con su PVP en el mes de la factura, igual que los almacenes con su propio mes de factura.
-- **Anticipos y descuentos consolidados.** El recibo no identifica vendedor. Se tratan como un pool y se reparten
-  en proporción a la liquidación ponderada de pagos de cada ejecutivo, lo que equivale a aplicar a cada uno su propio
-  % de bono. Si ningún pago pondera, el descuento se reparte según la liquidación base.
-- **% Bono.** Escala de rentabilidad ({fuente_escala_ej}) sobre la rentabilidad propia del ejecutivo en el mes.
-- **BONO FINAL.** Solo si el PVP del mes alcanza la meta individual. Meta adicional por ventas:
-  {"aplicada" if APLICA_META_ADICIONAL_EJECOM else "no aplicada a ejecutivos"}.
-- **Exentas.** % Exentas y DESC EXENTAS se informan con el mismo criterio que en almacenes; no modifican BONO TOTAL.
-- **Cruce de nombres.** Ventas y pagos se cruzan por nombre de vendedor sin distinguir mayúsculas ni espacios
-  repetidos. Se reemplaza por el código SAP cuando el vínculo con Talento Humano esté disponible.
-"""))
+        st.markdown("---")
+        st.caption(f"Ejecutivos que cumplen: {n_cumplen} de {len(df_ejec)} · "
+                   f"Bono Final individual acumulado: ${bf_ejec:,.2f}")
 
-st.caption("Los porcentajes se guardan como fracción y se multiplican por 100 solo para mostrarlos.")
 #st.markdown("---")
 #st.caption("Los porcentajes se guardan como fracción y se convierten a porcentaje solo para mostrar. "
 #           "EJECOM queda fuera de las tablas de almacenes: su auditoría completa vive en la pestaña de ejecutivos "
