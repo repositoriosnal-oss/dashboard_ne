@@ -1432,16 +1432,41 @@ def _pg_engine_bono():
     return create_engine(CADENA_CONEXION_PG)
 
 
+import math
+
+def _limpiar_para_json(obj):
+    """
+    Reemplaza recursivamente NaN, NaT y pd.NA por None para que json.dumps 
+    genere 'null' (el único valor nulo válido para el tipo jsonb de PostgreSQL).
+    """
+    if isinstance(obj, dict):
+        return {k: _limpiar_para_json(v) for k, v in obj.items()}
+    elif isinstance(obj, list):
+        return [_limpiar_para_json(v) for v in obj]
+    elif isinstance(obj, float) and math.isnan(obj):
+        return None
+    try:
+        if pd.isna(obj):
+            return None
+    except (ValueError, TypeError):
+        pass
+    return obj
+
 def _auditar_bono(tabla, registro_id, accion, antes, despues):
     usuario = st.session_state.get("usuario_actual", "desconocido")
+    
+    # 1. Limpiamos los diccionarios de valores NaN/NaT provenientes de Pandas
+    antes_clean = _limpiar_para_json(antes) if antes is not None else None
+    despues_clean = _limpiar_para_json(despues) if despues is not None else None
+    
     with _pg_engine_bono().begin() as c:
         c.execute(text("""
             INSERT INTO app.bono_auditoria (tabla, registro_id, accion, usuario, valores_anteriores, valores_nuevos)
             VALUES (:t, :r, :a, :u, CAST(:va AS jsonb), CAST(:vn AS jsonb))
         """), {
             "t": tabla, "r": registro_id, "a": accion, "u": usuario,
-            "va": _json.dumps(antes, default=str) if antes is not None else None,
-            "vn": _json.dumps(despues, default=str) if despues is not None else None,
+            "va": _json.dumps(antes_clean, default=str) if antes_clean is not None else None,
+            "vn": _json.dumps(despues_clean, default=str) if despues_clean is not None else None,
         })
 
 def bootstrap_bono_variables():
