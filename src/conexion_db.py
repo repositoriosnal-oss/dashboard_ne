@@ -3,6 +3,18 @@ import pandas as pd
 import numpy as np
 import pyodbc
 from sqlalchemy import create_engine, text
+from psycopg2.extensions import register_adapter, AsIs
+
+# Adaptadores para que psycopg2 entienda los tipos de numpy
+register_adapter(np.int64, AsIs)
+register_adapter(np.int32, AsIs)
+register_adapter(np.bool_, lambda v: AsIs("TRUE" if v else "FALSE"))
+
+# Importación de utilidades nativas y validaciones
+from src.bono_config import (
+    py as _py, fecha as _fecha, entero as _entero,
+    validar_metas as _validar_metas, validar_escala as _validar_escala,
+)
 
 # ============================================================
 # CONEXIÓN CENTRALIZADA POSTGRESQL (usando secretos seguros)
@@ -2148,3 +2160,69 @@ def obtener_exentas_auditadas_por_almacen(mes_periodo: str):
         resultado["EJECUTIVOS COMERCIALES"] = total_ej
 
     return resultado
+
+#============================================================
+#🔄 SINCRONIZACIÓN MODULAR: ANTICIPOS REGISTRADOS (PAGO A CUENTA)
+#============================================================
+def sync_pagos_a_cuenta():
+    """
+    Sincroniza los anticipos del mes actual (Pagos a Cuenta) desde SAP ORCT.
+    Captura recibos que aún no han sido aplicados a facturas (PayNoDoc = 'Y').
+    """
+    try:
+        sap_conf = st.secrets["sap"]
+        conn_str_sap = (
+            f"DRIVER={sap_conf['driver']};SERVERNODE={sap_conf['server']};"
+            f"UID={sap_conf['user']};PWD={sap_conf['password']}"
+        )
+        conexion_sap = pyodbc.connect(conn_str_sap)
+        pg_engine = create_engine(CADENA_CONEXION_PG)
+        
+        query = f"""
+        SELECT
+            T0."DocNum" AS "pago_nro",
+            T0."CardCode" AS "codigo_cliente",
+            T0."CardName" AS "nombre_cliente",
+            T0."DocDate" AS "fecha_recibo",
+            T0."DocTotal" AS "total_pago",
+            COALESCE(T0."U_NAL_Tipo_Pago", 'Sin Concepto') AS "concepto_anticipo",
+            COALESCE(T0."U_pedAbierto", '') AS "pedido_abierto",
+            COALESCE(T2."SeriesName", '') AS "nombre_serie_pago"
+        FROM "NE042025"."ORCT" T0
+        LEFT JOIN "NE042025"."NNM1" T2 ON T0."Series" = T2."Series"
+        WHERE T0."Canceled" = 'N'
+          AND T0."PayNoDoc" = 'Y'
+          AND T0."DocDate" >= '{FECHA_INICIO_AUDITORIA}'
+          AND T0."DocDate" <= '{FECHA_FIN_AUDITORIA}'
+          AND T2."SeriesName" NOT IN ('INGE','NDFINGEN','INGF','NCINGEN.','ND-INGEN','NPINGEN','FactClie','RC-INGEN')
+        """
+        
+        df = pd.read_sql(query, conexion_sap)
+        conexion_sap.close()
+        
+        if not df.empty:
+            # Reemplaza la tabla completa (es un snapshot del mes actual)
+            df.to_sql("pagos_a_cuenta", pg_engine, schema="sap_raw", if_exists="replace", index=False)
+            with pg_engine.begin() as c:
+                c.execute(text("CREATE INDEX IF NOT EXISTS idx_pac_fecha ON sap_raw.pagos_a_cuenta (fecha_recibo)"))
+                c.execute(text("CREATE INDEX IF NOT EXISTS idx_pac_serie ON sap_raw.pagos_a_cuenta (nombre_serie_pago)"))
+        return True
+    except Exception as e:
+        st.error(f"❌ Error sincronizando pagos a cuenta: {e}")
+        return False
+
+@st.cache_data(ttl=3600, show_spinner="Cargando Anticipos Registrados (Mes Actual)...")
+def cargar_pagos_a_cuenta():
+    """Lee los anticipos pendientes del mes actual desde PostgreSQL."""
+    try:
+        df = conn.query("SELECT * FROM sap_raw.pagos_a_cuenta")
+        if df.empty:
+            return df
+        df["fecha_recibo"] = pd.to_datetime(df["fecha_recibo"], errors="coerce")
+        df["total_pago"] = pd.to_numeric(df["total_pago"], errors="coerce").fillna(0)
+        # Mapear al almacén usando el mismo mapa de anticipos
+        df["nombre_almacen"] = df["nombre_serie_pago"].map(MAP_SERIE_ANTICIPOS).fillna("OTRO")
+        return df
+    except Exception as e:
+        st.error(f"Error cargando pagos a cuenta: {e}")
+        return pd.DataFrame()
