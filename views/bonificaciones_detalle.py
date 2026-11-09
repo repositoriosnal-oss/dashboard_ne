@@ -6,6 +6,9 @@ Estética inspirada en Variables del Bono con tarjetas CSS y contenedores limpio
 import streamlit as st
 import pandas as pd
 import numpy as np
+from src.conexion_db import (cargar_bonos_pagos, cargar_bonos_anticipos,
+                             cargar_pagos_consolidados, cargar_pagos_a_cuenta,
+                             resumen_pagos_a_cuenta)
 from datetime import date
 from html import escape
 from src.conexion_db import (
@@ -203,6 +206,12 @@ else:
 if dfp.empty:
     st.warning("Sin pagos en el rango y filtros seleccionados.")
     st.stop()
+
+# 🆕 Anticipos del mes presente (Pagos a Cuenta) con los filtros actuales
+pac = resumen_pagos_a_cuenta(desde, hasta,
+                             alm_sel if modo == "Almacenes" else [ALMACEN_EJECOM])
+df_pac = pac["filas"]
+
 
 # ============================================================
 # 📊 TARJETAS DE RESUMEN EJECUTIVO (KPIs principales)
@@ -465,6 +474,126 @@ else:
                 "Descuento Liquidación": st.column_config.NumberColumn(format="$%,.2f"),
             },
         )
+
+    # ============================================================
+    # 📥 ANTICIPOS DEL MES PRESENTE (PAGOS A CUENTA · ORCT.PayNoDoc = 'Y')
+    # ============================================================
+    st.markdown("---")
+    st.subheader("📥 Anticipos del Mes Presente (Pagos a Cuenta)")
+    st.caption(
+        "Recibos chulados como 'Pago a Cuenta' en SAP (`ORCT.PayNoDoc = 'Y`). "
+        "Concepto **Anticipo** (`U_NAL_Tipo_Pago`) → suma como anticipo del mes y exige "
+        "pedido abierto (`U_pedAbierto`). Concepto **Pago a Cartera** → NO suma. "
+        "Estos totales son INFORMATIVOS: no entran al Gran Total Bono ni al Valor Bono por "
+        "almacén hasta que Gerencia defina si se liquidan el mismo mes. Cuando el anticipo se "
+        "aplique a una factura en un mes siguiente, ya entra por la tabla de Anticipos normal."
+    )
+    
+    # 1. Cargar y filtrar (Mantiene tu lógica de fechas y modos)
+    df_pac = cargar_pagos_a_cuenta() 
+    
+    if df_pac.empty:
+        st.info("No hay pagos a cuenta registrados en la base de datos.")
+    else:
+        # Detectar nombre de columna de fecha por si en tu DB varía
+        col_fecha = 'fecha_recibo_pago' if 'fecha_recibo_pago' in df_pac.columns else 'fecha_recibo'
+        
+        pac_filtrado = df_pac[
+            (df_pac[col_fecha].dt.date >= desde) & 
+            (df_pac[col_fecha].dt.date <= hasta)
+        ].copy()
+        
+        # Aplicar filtros del sidebar (Almacenes o Ejecutivos)
+        if modo == "Almacenes" and alm_sel:
+            pac_filtrado = pac_filtrado[pac_filtrado["nombre_almacen"].isin(alm_sel)]
+        elif modo != "Almacenes":
+            pac_filtrado = pac_filtrado[pac_filtrado["nombre_almacen"] == ALMACEN_EJECOM]
+            
+        if pac_filtrado.empty:
+            st.info("No hay anticipos registrados (pagos a cuenta) en el rango y filtros seleccionados.")
+        else:
+            # 2. Preparar datos y calcular métricas para la interfaz
+            # Normalizar conceptos (por si vienen en mayúsculas/minúsculas)
+            concepto_str = pac_filtrado.get("concepto_anticipo", pd.Series([""] * len(pac_filtrado))).astype(str).str.upper()
+            pac_filtrado["es_anticipo"] = concepto_str.str.contains("ANTICIPO", na=False)
+            pac_filtrado["es_cartera"] = concepto_str.str.contains("CARTERA", na=False)
+            
+            # Detectar si falta pedido abierto
+            tiene_pedido = pac_filtrado.get("pedido_abierto", pd.Series([False] * len(pac_filtrado))).astype(bool)
+            pac_filtrado["pedido_faltante"] = pac_filtrado["es_anticipo"] & (~tiene_pedido)
+            
+            # Columna de monto (por si en tu DB se llama 'total_pago' o 'total_pago_original')
+            col_monto = 'total_pago_original' if 'total_pago_original' in pac_filtrado.columns else 'total_pago'
+            if "liq_estimada" not in pac_filtrado.columns:
+                pac_filtrado["liq_estimada"] = 0.0  # Placeholder si no viene de la DB
+            
+            # Diccionario 'pac' que exige la interfaz visual
+            pac = {
+                'recibidos': float(pac_filtrado[col_monto].sum()),
+                'anticipo': float(pac_filtrado.loc[pac_filtrado["es_anticipo"], col_monto].sum()),
+                'cartera': float(pac_filtrado.loc[pac_filtrado["es_cartera"], col_monto].sum()),
+                'sin_concepto': float(pac_filtrado.loc[~pac_filtrado["es_anticipo"] & ~pac_filtrado["es_cartera"], col_monto].sum()),
+                'liq_estimada': float(pac_filtrado["liq_estimada"].sum())
+            }
+            
+            # Sobreescribimos df_pac con el filtrado para la tabla final
+            df_pac = pac_filtrado 
+
+            # 3. INTERFAZ VISUAL (Tarjetas KPI y Alertas)
+            k1, k2, k3, k4, k5 = st.columns(5)
+            with k1.container(border=True, height=120):
+                st.metric("Recibido a Cuenta", f"${pac['recibidos']:,.2f}",
+                          help="Total de recibos con PayNoDoc = 'Y' en el rango")
+            with k2.container(border=True, height=120):
+                st.metric("Concepto ANTICIPO (sí cuenta)", f"${pac['anticipo']:,.2f}")
+            with k3.container(border=True, height=120):
+                st.metric("Concepto PAGO A CARTERA (no cuenta)", f"${pac['cartera']:,.2f}")
+            with k4.container(border=True, height=120):
+                st.metric("Sin concepto", f"${pac['sin_concepto']:,.2f}",
+                          help="Recibos a cuenta sin U_NAL_Tipo_Pago: revisar con contabilidad")
+            with k5.container(border=True, height=120):
+                st.metric("LIQ estimada anticipos (info)", f"${pac['liq_estimada']:,.2f}",
+                          help="valor_base × 0.8% × % bono del mes del recibo. Estimación, no liquidación real.")
+
+            faltan = df_pac[df_pac["pedido_faltante"]]
+            if not faltan.empty:
+                st.warning(f"⚠️ {len(faltan)} recibo(s) con concepto 'Anticipo' SIN pedido abierto "
+                           f"(SAP ORCT.U_pedAbierto): {', '.join(faltan['pago_nro'].astype(str).head(10))}.")
+            if pac["sin_concepto"] > 0:
+                st.warning("Hay recibos a cuenta sin concepto de anticipo: no se clasifican ni como "
+                           "anticipo ni como pago a cartera.")
+
+            # 4. Tabla de Detalle (Usando variables dinámicas para evitar KeyErrors)
+            cols_tabla = ["pago_nro", col_fecha, "nombre_almacen", "nombre_cliente",
+                          col_monto, "monto_final", "concepto_anticipo",
+                          "pedido_abierto", "es_anticipo", "liq_estimada"]
+            
+            # Asegurar que las columnas existan para no romper el dataframe
+            for c in cols_tabla:
+                if c not in df_pac.columns:
+                    if c == "monto_final" and "saldo_a_cuenta" in df_pac.columns:
+                        df_pac["monto_final"] = df_pac["saldo_a_cuenta"]
+                    else:
+                        df_pac[c] = None
+
+            st.dataframe(
+                df_pac[cols_tabla].rename(columns={
+                    "pago_nro": "Recibo", col_fecha: "Fecha",
+                    "nombre_almacen": "Almacén", "nombre_cliente": "Cliente",
+                    col_monto: "Valor Recibo", "monto_final": "Saldo a Cuenta",
+                    "concepto_anticipo": "Concepto (U_NAL_Tipo_Pago)",
+                    "pedido_abierto": "Pedido Abierto (U_pedAbierto)",
+                    "es_anticipo": "¿Cuenta como Anticipo?", "liq_estimada": "LIQ Estimada (info)"}),
+                use_container_width=True, hide_index=True, height=400,
+                column_config={
+                    "Fecha": st.column_config.DateColumn(format="DD/MM/YYYY"),
+                    "Almacén": st.column_config.TextColumn(width="medium"),
+                    "Cliente": st.column_config.TextColumn(width="large"),
+                    "Valor Recibo": st.column_config.NumberColumn(format="$%,.2f"),
+                    "Saldo a Cuenta": st.column_config.NumberColumn(format="$%,.2f"),
+                    "LIQ Estimada (info)": st.column_config.NumberColumn(format="$%,.2f"),
+                    "¿Cuenta como Anticipo?": st.column_config.CheckboxColumn(),
+                })
 
 # ============================================================
 # 📊 DISTRIBUCIÓN (por almacén o por ejecutivo, según el modo)
