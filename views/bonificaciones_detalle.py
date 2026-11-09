@@ -228,13 +228,16 @@ if not df_ant.empty:
             ant = ant[ant["nombre_almacen"].isin(alm_sel)]
     else:
         ant = ant[ant["nombre_almacen"] == ALMACEN_EJECOM]
-    
+
     if not ant.empty:
-        ant["liq_app"] = np.where(
-            ant["monto_validado"] > 0,
-            (ant["monto_validado"] / 1.19) * 0.975 * 0.008 * ant["pct_bono"],
-            0
-        )
+        if "liq_anticipo_total" in ant.columns:
+            ant["liq_app"] = ant["liq_anticipo_total"]   # misma fuente que Conciliación
+        else:
+            ant["liq_app"] = np.where(
+                ant["monto_validado"] > 0,
+                (ant["monto_validado"] / 1.19) * 0.975 * 0.008 * ant["pct_bono"],
+                0
+            )
 
 dfc = pd.DataFrame()
 df_cons = cargar_pagos_consolidados()
@@ -348,6 +351,8 @@ if ant.empty:
     st.info("Sin anticipos en el rango y filtros seleccionados.")
 else:
     grupo = ant.groupby("pago_nro").agg(
+        Estado=("estado_anticipo", "first"),
+        Pedido=("pedido_abierto", "first"),
         Almacen=("nombre_almacen", "first"),
         total_pago_original=("total_pago_original", "first"),
         monto_aplicado=("monto_aplicado", "sum"),
@@ -368,12 +373,17 @@ else:
                                            grupo["liquidacion_ok_apps"], 0)
         
         pagos_liq_total = float(dfp["liquidacion_ok"].sum())
-        tabla_ant = grupo[["pago_nro", "Almacen", "total_pago_original", "monto_aplicado",
+        
+        # 1. Se agregan Estado y Pedido a la tabla
+        tabla_ant = grupo[["pago_nro", "Estado", "Pedido", "Almacen", "total_pago_original", "monto_aplicado",
                            "saldo_a_cuenta", "monto_final", "liquidacion_ok"]].copy()
         tabla_ant["Valor_Bono"] = pagos_liq_total + tabla_ant["liquidacion_ok"]
         
+        # 2. Se agregan vacíos en la fila Total para que no rompa
         fila_total_ant = pd.DataFrame([{
             "pago_nro": "Total",
+            "Estado": "",
+            "Pedido": "",
             "Almacen": "",
             "total_pago_original": tabla_ant["total_pago_original"].sum(),
             "monto_aplicado": tabla_ant["monto_aplicado"].sum(),
@@ -387,8 +397,11 @@ else:
         
         with st.container(border=True):
             st.dataframe(
+                # 3. Se mapean los nuevos nombres
                 tabla_ant_mostrar.rename(columns={
                     "pago_nro": "Pago Nro",
+                    "Estado": "Estado anticipo",
+                    "Pedido": "Pedido abierto (SAP)",
                     "Almacen": "Almacén",
                     "total_pago_original": "Suma de Total Pago Original",
                     "monto_aplicado": "Suma de Monto Aplicado",
@@ -401,6 +414,8 @@ else:
                 hide_index=True,
                 height=420,
                 column_config={
+                    "Estado anticipo": st.column_config.TextColumn(width="small"),
+                    "Pedido abierto (SAP)": st.column_config.TextColumn(width="medium"),
                     "Almacén": st.column_config.TextColumn(width="medium"),
                     "Suma de Total Pago Original": st.column_config.NumberColumn(format="$%,.2f"),
                     "Suma de Monto Aplicado": st.column_config.NumberColumn(format="$%,.2f"),
@@ -411,10 +426,28 @@ else:
                 },
             )
         
+        # 4. Nuevo Control de no duplicidad (reemplaza tu bloque de auditoría viejo)
+        if "liq_anticipo_total" in ant.columns:
+            st.markdown("---")
+            st.subheader("Control de no duplicidad de anticipos")
+            ctrl = ant.groupby("estado_anticipo", as_index=False).agg(
+                recibos=("pago_nro", "nunique"), saldo=("monto_final", "sum"),
+                liq=("liq_anticipo_total", "sum"))
+            st.dataframe(ctrl.rename(columns={"estado_anticipo": "Estado", "recibos": "Recibos",
+                                               "saldo": "Saldo/Valor ($)", "liq": "Liquidación ($)"}),
+                         use_container_width=True, hide_index=True,
+                         column_config={"Saldo/Valor ($)": st.column_config.NumberColumn(format="$%,.2f"),
+                                        "Liquidación ($)": st.column_config.NumberColumn(format="$%,.2f")})
+            verif = float(ant["liq_aplicada"].sum() + ant["liq_estimada"].sum() - ant["liq_anticipo_total"].sum())
+            st.caption(f"Cada recibo vive en un único estado. Verificación de solape "
+                       f"(aplicada + estimada − total, debe ser $0.00): ${verif:,.2f}")
+        else:
+            st.warning("⚠️ Las columnas de auditoría aún no existen. Ejecuta **Forzar Sincronización SAP**.")
+
         if modo == "Ejecutivos Comerciales":
             st.caption("ℹ️ Los anticipos no traen código de vendedor desde SAP: en modo "
                       "Ejecutivos se muestran y suman a nivel EJECOM, sin atribuirlos a un comercial.")
-
+            
 # ============================================================
 # 🚩 TABLA DE CONTROL: PAGOS EN CONCILIACIÓN CONSOLIDADA
 # ============================================================
@@ -479,7 +512,7 @@ else:
     # 📥 ANTICIPOS DEL MES PRESENTE (PAGOS A CUENTA · ORCT.PayNoDoc = 'Y')
     # ============================================================
     st.markdown("---")
-    st.subheader("📥 Anticipos del Mes Presente (Pagos a Cuenta)")
+    st.subheader("Anticipos del Mes Presente (Pagos a Cuenta)")
     st.caption(
         "Recibos chulados como 'Pago a Cuenta' en SAP (`ORCT.PayNoDoc = 'Y`). "
         "Concepto **Anticipo** (`U_NAL_Tipo_Pago`) → suma como anticipo del mes y exige "

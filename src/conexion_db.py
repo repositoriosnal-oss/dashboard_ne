@@ -1279,20 +1279,20 @@ def cargar_pagos_consolidados(tolerancia: float = 100.0):
         df["nombre_almacen"] = df["serie"].map(MAP_SERIE_ANTICIPOS).fillna("OTRO")
     return df
 
-
 @st.cache_data(ttl=3600, show_spinner="Cargando anticipos...")
 def cargar_bonos_anticipos():
     try:
         df = conn.query("SELECT * FROM sap_raw.bonos_anticipos")
         if df.empty:
             return df
+            
         for c in ["fecha_recibo_pago", "fecha_aplicacion", "fecha_factura"]:
             df[c] = pd.to_datetime(df[c], errors="coerce")
         for c in ["total_pago_original", "monto_aplicado", "saldo_a_cuenta"]:
             df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0)
-
+            
         df["nombre_almacen"] = df["nombre_serie_pago"].map(MAP_SERIE_ANTICIPOS).fillna("OTRO")
-
+        
         distinto_mes = (
             (df["fecha_recibo_pago"].dt.to_period("M") != df["fecha_aplicacion"].dt.to_period("M"))
             | df["fecha_aplicacion"].isna()
@@ -1301,7 +1301,7 @@ def cargar_bonos_anticipos():
         df["monto_validado"] = np.where(distinto_mes & factura_posterior, df["monto_aplicado"], 0.0)
         df["monto_final"] = np.where(df["monto_validado"] == 0, df["saldo_a_cuenta"], df["monto_validado"])
         df["valor_base"] = (df["monto_final"] / 1.19) * 0.975
-
+        
         serie_fact = df["nombre_serie_factura"].map(MAP_SERIE_FACTURA).fillna("OTRO")
         en_tabla = (
             df["fecha_factura"].notna()
@@ -1311,7 +1311,7 @@ def cargar_bonos_anticipos():
         df["almacen_factura"] = np.where(en_tabla, serie_fact, "Sin Almacén Encontrado")
         df["_anio_f"] = df["fecha_factura"].dt.year
         df["_mes_f"] = df["fecha_factura"].dt.month
-
+        
         lookup = pct_bono_por_mes_almacen().rename(
             columns={"nombre_almacen": "almacen_key"}
         )[["anio", "mes", "almacen_key", "pct_bono"]]
@@ -1320,67 +1320,108 @@ def cargar_bonos_anticipos():
         df["pct_bono"] = df["pct_bono"].fillna(0.0)
         df.drop(columns=["anio", "mes", "almacen_key", "_anio_f", "_mes_f"], inplace=True, errors="ignore")
 
-        df["liquidacion_ok"] = df["valor_base"] * 0.008 * df["pct_bono"]
-
-        # 🆕 Pagos a Cuenta: concepto y pedido abierto (ORCT.PayNoDoc / U_NAL_Tipo_Pago / U_pedAbierto)
+        # ==========================================
+        # 🆕 AQUÍ VA EL BLOQUE QUE ME PREGUNTAS
+        # ==========================================
+        # ---- 🆕 Pagos a cuenta / concepto / pedido (ORCT) ----
         if "pago_a_cuenta" in df.columns:
             df["pago_a_cuenta"] = (df["pago_a_cuenta"].astype(str).str.strip().str.upper()
                                    .replace({"": "N", "NONE": "N", "NAN": "N"}).fillna("N"))
         else:
-            df["pago_a_cuenta"] = "N"  # tabla aún sin sincronizar con los campos nuevos
+            df["pago_a_cuenta"] = "N"
+            
         df["concepto_anticipo"] = (df["concepto_anticipo"].fillna("").astype(str).str.strip()
-                                   if "concepto_anticipo" in df.columns
-                                   else pd.Series("", index=df.index))
+                                   if "concepto_anticipo" in df.columns else pd.Series("", index=df.index))
         df["pedido_abierto"] = (df["pedido_abierto"].fillna("").astype(str).str.strip()
-                                if "pedido_abierto" in df.columns
-                                else pd.Series("", index=df.index))
+                                if "pedido_abierto" in df.columns else pd.Series("", index=df.index))
+        
         _conc = df["concepto_anticipo"].str.upper()
         df["es_anticipo"] = _conc.str.contains("ANTICIPO", na=False)
         df["es_cartera"] = _conc.str.contains("CARTERA", na=False) & ~df["es_anticipo"]
+
+        # ---- Switch por período, evaluado por MES DEL RECIBO ----
+        switch = {}
+        for m in df["fecha_recibo_pago"].dt.to_period("M").unique():
+            rp, _, _ = resolver_periodo_bono(m.start_time.date())
+            switch[m] = bool(rp["liquidar_anticipos_mismo_mes"]) if rp is not None and "liquidar_anticipos_mismo_mes" in rp.index else False
+            
+        df["_mes_rec"] = df["fecha_recibo_pago"].dt.to_period("M")
+        df["switch_mismo_mes"] = df["_mes_rec"].map(switch).fillna(False)
+
+        # ---- % bono del mes del recibo (base de la estimación) ----
+        lk = pct_bono_por_mes_almacen().rename(columns={"nombre_almacen": "almacen_key"})[
+            ["anio", "mes", "almacen_key", "pct_bono"]]
+        df["_anio_r"] = df["fecha_recibo_pago"].dt.year
+        df["_mes_r"] = df["fecha_recibo_pago"].dt.month
+        df = df.merge(lk, left_on=["_anio_r", "_mes_r", "nombre_almacen"],
+                      right_on=["anio", "mes", "almacen_key"], how="left", suffixes=("", "_rec"))
+        df["pct_bono_mes_recibo"] = df["pct_bono_rec"].fillna(0.0)
+
+        # ---- Estados mutuamente excluyentes (anti doble conteo) ----
+        aplicada = df["monto_validado"] > 0
+        sin_saldo = df["monto_final"] <= 0
+        marcada = (df["pago_a_cuenta"] == "Y") & df["es_anticipo"]
+        
+        df["liq_aplicada"] = np.where(aplicada, df["valor_base"] * 0.008 * df["pct_bono"], 0.0)
+        df["liq_estimada"] = np.where((~aplicada) & (~sin_saldo) & marcada & df["switch_mismo_mes"],
+                                      df["valor_base"] * 0.008 * df["pct_bono_mes_recibo"], 0.0)
+                                      
+        # Defensa profunda: un recibo aplicado jamás conserva estimación
+        df.loc[aplicada, "liq_estimada"] = 0.0
+        df["liq_anticipo_total"] = df["liq_aplicada"] + df["liq_estimada"]
+        
+        df["estado_anticipo"] = np.select(
+            [aplicada, sin_saldo, marcada & df["switch_mismo_mes"], marcada & ~df["switch_mismo_mes"]],
+            ["Anticipo aplicado (mes posterior)",
+             "Pago aplicado (no anticipo)",
+             "Anticipo contado mismo mes (estimado)",
+             "Anticipo pendiente (switch OFF)"],
+            default="Pago a cuenta sin concepto anticipo (no cuenta)")
+            
+        df["pedido_faltante"] = marcada & (df["pedido_abierto"] == "") & (~aplicada)
+        
+        # ==========================================
+        # 🛡️ REEMPLAZO DE LA LÍNEA FINAL
+        # ==========================================
+        # Antigua línea: df["liquidacion_ok"] = df["valor_base"] * 0.008 * df["pct_bono"]
+        # Nueva línea (usa el total blindado para que el sistema lea la suma de aplicada + estimada):
+        df["liquidacion_ok"] = df["liq_anticipo_total"]   
+        
+        # Si prefieres que SOLO cuente la real (ignorando la estimada del mismo mes), 
+        # cambia la línea de arriba por: df["liquidacion_ok"] = df["liq_aplicada"]
+        
+        df = df.drop(columns=["anio", "mes", "almacen_key", "_anio_r", "_mes_r", "_mes_rec", "pct_bono_rec"], errors="ignore")
+        
         return df
+        
     except Exception as e:
         st.error(f"Error cargando anticipos: {e}")
         return pd.DataFrame()
-
+    
 # ============================================================
 # 📥 ANTICIPOS DEL MES PRESENTE (PAGOS A CUENTA · ORCT.PayNoDoc = 'Y')
-# Regla: concepto "Anticipo" (U_NAL_Tipo_Pago) → SÍ cuenta como anticipo del mes
-#        y exige pedido abierto (U_pedAbierto); concepto "Pago a Cartera" → NO cuenta.
-# INFORMATIVO: no entra al Total_Bono / Valor Bono hasta que Gerencia defina
-# si los anticipos del mes presente se liquidan el mismo mes.
+# Fuente única: se derivan de cargar_bonos_anticipos(), que ya trae
+# pago_a_cuenta, concepto_anticipo, pedido_abierto y los estados liq_*.
+# INFORMATIVO: no entra al Total_Bono hasta que Gerencia active el switch.
 # ============================================================
 @st.cache_data(ttl=3600, show_spinner="Cargando pagos a cuenta (anticipos del mes)...")
 def cargar_pagos_a_cuenta():
-    """Recibos de ORCT chulados como 'Pago a Cuenta' (PayNoDoc = 'Y')."""
+    """Recibos de ORCT marcados 'Pago a Cuenta' (PayNoDoc = 'Y'), con estados."""
     df = cargar_bonos_anticipos()
     if df.empty or "pago_a_cuenta" not in df.columns:
         return pd.DataFrame()
-    pac = df[df["pago_a_cuenta"] == "Y"].copy()
-    if pac.empty:
-        return pac
-    pac["pedido_faltante"] = pac["es_anticipo"] & (pac["pedido_abierto"] == "")
-    # LIQ estimada (informativa): misma cadena de anticipos pero con el % de bono del
-    # MES DEL RECIBO, porque el anticipo aún no tiene factura que le fije el pct real.
-    lookup = (pct_bono_por_mes_almacen()
-              .rename(columns={"nombre_almacen": "almacen_key"})[["anio", "mes", "almacen_key", "pct_bono"]])
-    pac["_anio"] = pac["fecha_recibo_pago"].dt.year
-    pac["_mes"] = pac["fecha_recibo_pago"].dt.month
-    pac = pac.merge(lookup, left_on=["_anio", "_mes", "nombre_almacen"],
-                    right_on=["anio", "mes", "almacen_key"], how="left")
-    pac["pct_bono_mes_recibo"] = pac["pct_bono"].fillna(0.0)
-    pac["liq_estimada"] = np.where(pac["es_anticipo"],
-                                   pac["valor_base"] * 0.008 * pac["pct_bono_mes_recibo"], 0.0)
-    return pac.drop(columns=["anio", "mes", "almacen_key", "_anio", "_mes"], errors="ignore")
+    return df[df["pago_a_cuenta"] == "Y"].copy()
 
 
 def resumen_pagos_a_cuenta(desde, hasta, alm_sel=None) -> dict:
     """Totales del rango para los KPIs de Detalle Bono (no toca el cálculo del bono)."""
-    out = {"recibidos": 0.0, "anticipo": 0.0, "cartera": 0.0,
-           "sin_concepto": 0.0, "liq_estimada": 0.0, "filas": pd.DataFrame()}
+    out = {"recibidos": 0.0, "anticipo": 0.0, "cartera": 0.0, "sin_concepto": 0.0,
+           "estimado": 0.0, "liq_estimada": 0.0, "aplicado": 0.0, "filas": pd.DataFrame()}
     pac = cargar_pagos_a_cuenta()
     if pac.empty:
         return out
-    f = pac[(pac["fecha_recibo_pago"].dt.date >= desde) & (pac["fecha_recibo_pago"].dt.date <= hasta)]
+    f = pac[(pac["fecha_recibo_pago"].dt.date >= desde) &
+            (pac["fecha_recibo_pago"].dt.date <= hasta)]
     if alm_sel:
         f = f[f["nombre_almacen"].isin(alm_sel)]
     out["filas"] = f
@@ -1388,7 +1429,9 @@ def resumen_pagos_a_cuenta(desde, hasta, alm_sel=None) -> dict:
     out["anticipo"] = float(f.loc[f["es_anticipo"], "monto_final"].sum())
     out["cartera"] = float(f.loc[f["es_cartera"], "monto_final"].sum())
     out["sin_concepto"] = float(f.loc[~f["es_anticipo"] & ~f["es_cartera"], "monto_final"].sum())
-    out["liq_estimada"] = float(f["liq_estimada"].sum())
+    out["estimado"] = float(f["liq_estimada"].sum())
+    out["liq_estimada"] = out["estimado"]          # alias: ambas claves quedan disponibles
+    out["aplicado"] = float(f["liq_aplicada"].sum())
     return out
 
 # ============================================================
@@ -1425,11 +1468,15 @@ def calcular_distribucion_bono_almacen(desde, hasta, alm_sel=None):
         ].copy()
         if alm_sel:
             ant = ant[ant["nombre_almacen"].isin(alm_sel)]
-        ant["liq_app"] = np.where(
-            ant["monto_validado"] > 0,
-            (ant["monto_validado"] / 1.19) * 0.975 * 0.008 * ant["pct_bono"],
-            0,
-        )
+            
+        # 🆕 Lógica blindada para liq_app (anticipos)
+        if "liq_anticipo_total" in ant.columns:
+            ant["liq_app"] = ant["liq_anticipo_total"]      # aplicada + estimada, excluyentes
+        else:
+            ant["liq_app"] = np.where(ant["monto_validado"] > 0,
+                                      (ant["monto_validado"] / 1.19) * 0.975 * 0.008 * ant["pct_bono"], 0)
+                                      
+        # Agrupamos por la columna calculada/validada 'liq_app'
         resumen_anticipos = ant.groupby("nombre_almacen", as_index=False)["liq_app"].sum()
         resumen_anticipos = resumen_anticipos.rename(columns={"liq_app": "liq_anticipos"})
     else:
@@ -1452,7 +1499,6 @@ def calcular_distribucion_bono_almacen(desde, hasta, alm_sel=None):
     resumen = pd.merge(resumen, resumen_descuentos, on="nombre_almacen", how="outer").fillna(0.0)
     resumen["Total_Bono"] = resumen["liq_pagos"] + resumen["liq_anticipos"] - resumen["descuento_liq"]
     return resumen[cols_out]
-
 
 # ============================================================
 # 🎛️ VARIABLES DEL BONO: bootstrap, resolver y CRUD auditado
@@ -1620,6 +1666,9 @@ def bootstrap_bono_variables():
         c.execute(text("""
             ALTER TABLE app.bono_periodos_metas ADD COLUMN IF NOT EXISTS ambito TEXT NOT NULL DEFAULT 'ALMACEN';
             ALTER TABLE app.bono_periodos_escala ADD COLUMN IF NOT EXISTS ambito TEXT NOT NULL DEFAULT 'ALMACEN';
+            ALTER TABLE app.bono_periodos ADD COLUMN IF NOT EXISTS meta_ejecutivo_mensual NUMERIC NOT NULL DEFAULT 430000000;
+            -- 🆕 NUEVO SWITCH
+            ALTER TABLE app.bono_periodos ADD COLUMN IF NOT EXISTS liquidar_anticipos_mismo_mes BOOLEAN NOT NULL DEFAULT FALSE;
         """))
         #  Meta individual de ejecutivos comerciales como variable del período
         c.execute(text("""
@@ -1990,7 +2039,7 @@ def _validar_sin_solape(f_ini, f_fin, excluir_id=None):
 CAMPOS_PERIODO_PERMITIDOS = {
     "nombre", "fecha_inicio", "fecha_fin", "factor_desc_exentas",
     "meta_adic_base", "meta_adic_bloque", "meta_adic_pct", "activo",
-    "meta_ejecutivo_mensual",
+    "meta_ejecutivo_mensual", "liquidar_anticipos_mismo_mes"
 }
 
 
@@ -2230,69 +2279,3 @@ def obtener_exentas_auditadas_por_almacen(mes_periodo: str):
         resultado["EJECUTIVOS COMERCIALES"] = total_ej
 
     return resultado
-
-#============================================================
-#🔄 SINCRONIZACIÓN MODULAR: ANTICIPOS REGISTRADOS (PAGO A CUENTA)
-#============================================================
-def sync_pagos_a_cuenta():
-    """
-    Sincroniza los anticipos del mes actual (Pagos a Cuenta) desde SAP ORCT.
-    Captura recibos que aún no han sido aplicados a facturas (PayNoDoc = 'Y').
-    """
-    try:
-        sap_conf = st.secrets["sap"]
-        conn_str_sap = (
-            f"DRIVER={sap_conf['driver']};SERVERNODE={sap_conf['server']};"
-            f"UID={sap_conf['user']};PWD={sap_conf['password']}"
-        )
-        conexion_sap = pyodbc.connect(conn_str_sap)
-        pg_engine = create_engine(CADENA_CONEXION_PG)
-        
-        query = f"""
-        SELECT
-            T0."DocNum" AS "pago_nro",
-            T0."CardCode" AS "codigo_cliente",
-            T0."CardName" AS "nombre_cliente",
-            T0."DocDate" AS "fecha_recibo",
-            T0."DocTotal" AS "total_pago",
-            COALESCE(T0."U_NAL_Tipo_Pago", 'Sin Concepto') AS "concepto_anticipo",
-            COALESCE(T0."U_pedAbierto", '') AS "pedido_abierto",
-            COALESCE(T2."SeriesName", '') AS "nombre_serie_pago"
-        FROM "NE042025"."ORCT" T0
-        LEFT JOIN "NE042025"."NNM1" T2 ON T0."Series" = T2."Series"
-        WHERE T0."Canceled" = 'N'
-          AND T0."PayNoDoc" = 'Y'
-          AND T0."DocDate" >= '{FECHA_INICIO_AUDITORIA}'
-          AND T0."DocDate" <= '{FECHA_FIN_AUDITORIA}'
-          AND T2."SeriesName" NOT IN ('INGE','NDFINGEN','INGF','NCINGEN.','ND-INGEN','NPINGEN','FactClie','RC-INGEN')
-        """
-        
-        df = pd.read_sql(query, conexion_sap)
-        conexion_sap.close()
-        
-        if not df.empty:
-            # Reemplaza la tabla completa (es un snapshot del mes actual)
-            df.to_sql("pagos_a_cuenta", pg_engine, schema="sap_raw", if_exists="replace", index=False)
-            with pg_engine.begin() as c:
-                c.execute(text("CREATE INDEX IF NOT EXISTS idx_pac_fecha ON sap_raw.pagos_a_cuenta (fecha_recibo)"))
-                c.execute(text("CREATE INDEX IF NOT EXISTS idx_pac_serie ON sap_raw.pagos_a_cuenta (nombre_serie_pago)"))
-        return True
-    except Exception as e:
-        st.error(f"❌ Error sincronizando pagos a cuenta: {e}")
-        return False
-
-@st.cache_data(ttl=3600, show_spinner="Cargando Anticipos Registrados (Mes Actual)...")
-def cargar_pagos_a_cuenta():
-    """Lee los anticipos pendientes del mes actual desde PostgreSQL."""
-    try:
-        df = conn.query("SELECT * FROM sap_raw.pagos_a_cuenta")
-        if df.empty:
-            return df
-        df["fecha_recibo"] = pd.to_datetime(df["fecha_recibo"], errors="coerce")
-        df["total_pago"] = pd.to_numeric(df["total_pago"], errors="coerce").fillna(0)
-        # Mapear al almacén usando el mismo mapa de anticipos
-        df["nombre_almacen"] = df["nombre_serie_pago"].map(MAP_SERIE_ANTICIPOS).fillna("OTRO")
-        return df
-    except Exception as e:
-        st.error(f"Error cargando pagos a cuenta: {e}")
-        return pd.DataFrame()

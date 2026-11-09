@@ -313,6 +313,13 @@ with tab_res:
     per_display["fecha_inicio"] = pd.to_datetime(per_display["fecha_inicio"])
     per_display["factor_desc_exentas"] = per_display["factor_desc_exentas"].astype(float) * 100
     per_display["meta_adic_pct"] = per_display["meta_adic_pct"].astype(float) * 100
+
+    if "liquidar_anticipos_mismo_mes" in per.columns:
+        per_display["Liq. anticipos mismo mes"] = ["SÍ" if bool(v) else "no"
+                                                   for v in per["liquidar_anticipos_mismo_mes"]]
+    else:
+        per_display["Liq. anticipos mismo mes"] = "no"
+
     st.dataframe(
         per_display.drop(columns=["id"]).rename(columns={
             "nombre": "Período", "fecha_inicio": "Inicio", "fecha_fin": "Fin",
@@ -325,7 +332,8 @@ with tab_res:
             "Vigente": st.column_config.TextColumn(width="small"),
             "Factor DESC Exentas": st.column_config.NumberColumn(format="%.0f%%"),
             "Base Meta Adicional": st.column_config.NumberColumn(format="$%,.0f"),
-            "Bloque": st.column_config.NumberColumn(format="$%,.0f"),
+            "Bloque": st.column_config.NumberColumn(format="$%,.0f"),            
+            "Liq. anticipos mismo mes": st.column_config.TextColumn(width="small"),
             "% por Bloque": st.column_config.NumberColumn(format="%.0f%%")})
 
     st.markdown("---")
@@ -508,12 +516,22 @@ with tab_edit:
                                      value=float(periodo_row["meta_adic_bloque"]), step=50_000_000.0)
         e_pct = st.number_input("% por Bloque", min_value=0.0, max_value=1.0,
                                 value=float(periodo_row["meta_adic_pct"]), step=0.01)
+
+        # 🆕 SWITCH DE ANTICIPOS (uno solo, sin duplicados)
+        e_liquidar_ant = st.toggle(
+            "Liquidar anticipos estimados (mismo mes)",
+            value=bool(periodo_row.get("liquidar_anticipos_mismo_mes", False)),
+            help="Si está ON, los recibos 'Pago a Cuenta' con concepto 'Anticipo' y saldo abierto "
+                 "suman una liquidación ESTIMADA al mes del recibo. Al aplicarse en SAP pasan "
+                 "solos a liquidación real (nunca se suman las dos).")
+
         guardar_gen = st.form_submit_button("Guardar parámetros generales", type="primary")
         if guardar_gen:
             ejecutar(lambda: actualizar_periodo(periodo_id, {
                 "nombre": e_nombre, "fecha_inicio": e_fini, "fecha_fin": e_ffin,
                 "factor_desc_exentas": e_factor, "meta_adic_base": e_base,
-                "meta_adic_bloque": e_bloque, "meta_adic_pct": e_pct}, usuario),
+                "meta_adic_bloque": e_bloque, "meta_adic_pct": e_pct,
+                "liquidar_anticipos_mismo_mes": e_liquidar_ant}, usuario),
                 "Parámetros generales actualizados.")
 
     st.markdown("---")
