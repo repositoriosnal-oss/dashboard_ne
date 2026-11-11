@@ -122,6 +122,18 @@ def fmt_cop_dec(v) -> str:
         return "-"
     return f"${v:,.2f}"
 
+def fmt_compacto(v) -> str:
+    """Versión corta para tarjetas: miles de millones → '12.34 mil M'; millones → '123.4 M'.
+    Evita que los números de 16 caracteres desborden los recuadros."""
+    if v is None or pd.isna(v):
+        return "-"
+    av = abs(v)
+    if av >= 1_000_000_000:
+        return f"${v / 1_000_000_000:,.2f} mil M"
+    if av >= 1_000_000:
+        return f"${v / 1_000_000:,.1f} M"
+    return f"${v:,.2f}"
+
 # ============================================================
 # ENCABEZADO Y CARGA
 # ============================================================
@@ -277,7 +289,7 @@ tarjetas([
 # TABLA DE PAGOS (réplica Power BI; en modo Ejecutivos muestra el Comercial)
 # ============================================================
 st.markdown('<div class="section-header"><h3>Detalle de Pagos Aplicados</h3>'
-            '<p>Réplica exacta del modelo Power BI: pagos aplicados en el mes con liquidación OK</p></div>',
+            '<p>pagos aplicados en el mes con liquidación OK</p></div>',
             unsafe_allow_html=True)
 
 agg_map = {
@@ -514,7 +526,7 @@ else:
     st.markdown("---")
     st.subheader("Anticipos del Mes Presente (Pagos a Cuenta)")
     st.caption(
-        "Recibos chulados como 'Pago a Cuenta' en SAP (`ORCT.PayNoDoc = 'Y`). "
+        "Recibos marcados como 'Pago a Cuenta' en SAP (ORCT.PayNoDoc = 'Y'). "
         "Concepto **Anticipo** (`U_NAL_Tipo_Pago`) → suma como anticipo del mes y exige "
         "pedido abierto (`U_pedAbierto`). Concepto **Pago a Cartera** → NO suma. "
         "Estos totales son INFORMATIVOS: no entran al Gran Total Bono ni al Valor Bono por "
@@ -547,9 +559,12 @@ else:
         else:
             # 2. Preparar datos y calcular métricas para la interfaz
             # Normalizar conceptos (por si vienen en mayúsculas/minúsculas)
-            concepto_str = pac_filtrado.get("concepto_anticipo", pd.Series([""] * len(pac_filtrado))).astype(str).str.upper()
-            pac_filtrado["es_anticipo"] = concepto_str.str.contains("ANTICIPO", na=False)
-            pac_filtrado["es_cartera"] = concepto_str.str.contains("CARTERA", na=False)
+            if "es_anticipo" not in pac_filtrado.columns or "es_cartera" not in pac_filtrado.columns:
+                _conc = (pac_filtrado.get("concepto_anticipo", pd.Series([""] * len(pac_filtrado)))
+                       .astype(str).str.strip().str.upper()
+                       .replace({"1": "PAGO A CARTERA", "2": "ANTICIPO"}))
+                pac_filtrado["es_anticipo"] = _conc.str.contains("ANTICIPO", na=False)
+                pac_filtrado["es_cartera"] = _conc.str.contains("CARTERA", na=False) & ~pac_filtrado["es_anticipo"]
             
             # Detectar si falta pedido abierto
             tiene_pedido = pac_filtrado.get("pedido_abierto", pd.Series([False] * len(pac_filtrado))).astype(bool)
@@ -573,25 +588,24 @@ else:
             df_pac = pac_filtrado 
 
             # 3. INTERFAZ VISUAL (Tarjetas KPI y Alertas)
-            k1, k2, k3, k4, k5 = st.columns(5)
-            with k1.container(border=True, height=120):
-                st.metric("Recibido a Cuenta", f"${pac['recibidos']:,.2f}",
-                          help="Total de recibos con PayNoDoc = 'Y' en el rango")
-            with k2.container(border=True, height=120):
-                st.metric("Concepto ANTICIPO (sí cuenta)", f"${pac['anticipo']:,.2f}")
-            with k3.container(border=True, height=120):
-                st.metric("Concepto PAGO A CARTERA (no cuenta)", f"${pac['cartera']:,.2f}")
-            with k4.container(border=True, height=120):
-                st.metric("Sin concepto", f"${pac['sin_concepto']:,.2f}",
-                          help="Recibos a cuenta sin U_NAL_Tipo_Pago: revisar con contabilidad")
-            with k5.container(border=True, height=120):
-                st.metric("LIQ estimada anticipos (info)", f"${pac['liq_estimada']:,.2f}",
-                          help="valor_base × 0.8% × % bono del mes del recibo. Estimación, no liquidación real.")
+                     # 3. INTERFAZ VISUAL (mismo estilo de tarjetas del Resumen: sin altura fija)
+            tarjetas([
+                ("Recibido a cuenta", fmt_compacto(pac["recibidos"]),
+                 f"Exacto: {fmt_cop_dec(pac['recibidos'])} · Recibos con PayNoDoc = 'Y' en el rango"),
+                ("Concepto ANTICIPO (sí cuenta)", fmt_compacto(pac["anticipo"]),
+                 f"Exacto: {fmt_cop_dec(pac['anticipo'])}"),
+                ("Concepto PAGO A CARTERA (no cuenta)", fmt_compacto(pac["cartera"]),
+                 f"Exacto: {fmt_cop_dec(pac['cartera'])}"),
+                ("Sin concepto", fmt_compacto(pac["sin_concepto"]),
+                 f"Exacto: {fmt_cop_dec(pac['sin_concepto'])} · Revisar con contabilidad"),
+                ("LIQ estimada anticipos (info)", fmt_compacto(pac["liq_estimada"]),
+                 f"Exacto: {fmt_cop_dec(pac['liq_estimada'])} · valor_base × 0.8% × % bono del mes del recibo"),
+            ])
 
             faltan = df_pac[df_pac["pedido_faltante"]]
             if not faltan.empty:
-                st.warning(f"⚠️ {len(faltan)} recibo(s) con concepto 'Anticipo' SIN pedido abierto "
-                           f"(SAP ORCT.U_pedAbierto): {', '.join(faltan['pago_nro'].astype(str).head(10))}.")
+                st.warning(f"⚠️ {len(faltan)} recibo(s) con concepto 'Anticipo' SIN pedido abierto ")
+                           #f"(SAP ORCT.U_pedAbierto): {', '.join(faltan['pago_nro'].astype(str).head(10))}.")
             if pac["sin_concepto"] > 0:
                 st.warning("Hay recibos a cuenta sin concepto de anticipo: no se clasifican ni como "
                            "anticipo ni como pago a cartera.")
@@ -708,9 +722,9 @@ if modo != "Almacenes":
 # ============================================================
 # PIE DE PÁGINA
 # ============================================================
-st.markdown("---")
-st.caption("💡 **Nota:** La Primera Etapa del Bono se compone de la suma de la Liquidación de Pagos "
-          "(aplicados en el mes) más la Liquidación de Anticipos (aplicaciones diferidas con Monto Final > 0). "
-          "Esta vista resume el impacto por cada Punto de Venta para la toma de decisiones gerenciales.")
-st.markdown("---")
-st.caption("🚧 **En construcción:** próxima iteración = anticipos + % Bono Aplicable Factura (tabla FACTURAS Y NC).")
+#st.markdown("---")
+#st.caption("💡 **Nota:** La Primera Etapa del Bono se compone de la suma de la Liquidación de Pagos "
+#          "(aplicados en el mes) más la Liquidación de Anticipos (aplicaciones diferidas con Monto Final > 0). "
+#          "Esta vista resume el impacto por cada Punto de Venta para la toma de decisiones gerenciales.")
+#st.markdown("---")
+#st.caption("🚧 **En construcción:** próxima iteración = anticipos + % Bono Aplicable Factura (tabla FACTURAS Y NC).")

@@ -477,27 +477,11 @@ with tab_alm:
                 "Suma de Precio total exentas": st.column_config.NumberColumn(format="$%,.2f"),
                 "Total Exentas": st.column_config.NumberColumn(format="$%,.2f")})
 
-        st.markdown("---")
-        st.subheader("2. Anticipos y Exentas por Almacén")
-        st.dataframe(
-            pd.concat([tabla2, fila_total2], ignore_index=True).rename(columns={
-                "nom_almacen": "Almacén", "Suma_Total_Anticipo": "Suma de Total Anticipo",
-                "Suma_Precio_Total_Exentas": "Suma de Precio total exentas", "Total_Exentas": "Total Exentas"}),
-            use_container_width=True, hide_index=True,
-            column_config={
-                "Suma de Total Anticipo": st.column_config.NumberColumn(format="$%,.2f"),
-                "Suma de Precio total exentas": st.column_config.NumberColumn(format="$%,.2f"),
-                "Total Exentas": st.column_config.NumberColumn(format="$%,.2f")})
-
         # 👇 PEGA EL FRAGMENTO AQUÍ 👇
         est_conc = float(ant["liq_estimada"].sum()) if (not ant.empty and "liq_estimada" in ant.columns) else 0.0
         if est_conc > 0:
             st.caption(f"Incluye ${est_conc:,.2f} de liquidación ESTIMADA de anticipos del mismo mes "
                        "(switch activo en el período). Al aplicarse en SAP se convierte en liquidación real.")
-
-        st.markdown("---")
-        st.subheader("3. Liquidación del Bono por Almacén")
-
 
         st.markdown("---")
         st.subheader("3. Liquidación del Bono por Almacén")

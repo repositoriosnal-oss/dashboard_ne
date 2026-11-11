@@ -67,6 +67,50 @@ st.title("Repartición y Liquidación del Bono por Colaborador")
 st.caption(f"Sesión: **{nombre_usuario}** · Rol: **{rol_actual.upper()}**. Conciliación comercial y liquidación neta a pagar.")
 
 # ============================================================
+#  ESTILO Y FORMATO (misma estética de Variables / Detalle Bono)
+# ============================================================
+from html import escape as _escape
+
+st.markdown("""
+<style>
+.kpi-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 12px; margin: 8px 0 20px 0; }
+.kpi { border: 1px solid rgba(128,128,128,.35); border-radius: 8px; padding: 14px 16px; min-width: 0; }
+.kpi-l { font-size: .75rem; letter-spacing: .04em; text-transform: uppercase; opacity: .72;
+         line-height: 1.3; font-weight: 600; }
+.kpi-v { font-size: clamp(1.1rem, 1.8vw, 1.5rem); font-weight: 700; line-height: 1.3; margin-top: 6px;
+         font-variant-numeric: tabular-nums; overflow-wrap: anywhere; color: #1f77b4; }
+.kpi-s { font-size: .75rem; opacity: .65; margin-top: 4px; line-height: 1.3; overflow-wrap: anywhere; }
+</style>
+""", unsafe_allow_html=True)
+
+def tarjetas(items):
+    """Grid de tarjetas KPI: (etiqueta, valor grande, subtítulo)."""
+    html = ['<div class="kpi-grid">']
+    for it in items:
+        lab, val = it[0], it[1]
+        sub = it[2] if len(it) > 2 else ""
+        s = f'<div class="kpi-s">{_escape(sub)}</div>' if sub else ""
+        html.append(f'<div class="kpi"><div class="kpi-l">{_escape(lab)}</div>'
+                    f'<div class="kpi-v">{_escape(val)}</div>{s}</div>')
+    html.append("</div>")
+    st.markdown("".join(html), unsafe_allow_html=True)
+
+def fmt_cop_dec(v) -> str:
+    return "-" if v is None or pd.isna(v) else f"${v:,.2f}"
+
+def fmt_compacto(v) -> str:
+    """Número corto para la tarjeta: miles de millones → '30.62 mil M'; millones → '94.8 M'."""
+    if v is None or pd.isna(v):
+        return "-"
+    av = abs(v)
+    if av >= 1_000_000_000:
+        return f"${v / 1_000_000_000:,.2f} mil M"
+    if av >= 1_000_000:
+        return f"${v / 1_000_000:,.1f} M"
+    return f"${v:,.2f}"
+
+# ============================================================
 # FUNCIONES AUXILIARES DE CÁLCULO DE CONCILIACIÓN
 # ============================================================
 def aplicar_tramo_ventas(pvp, tramos_df):
@@ -358,14 +402,20 @@ tot_desc_colabs = float(df_colabs_total["total_descuentos"].sum()) if not df_col
 tot_neto_colabs = float(df_colabs_total["bono_neto"].sum()) if not df_colabs_total.empty else 0.0
 cant_beneficiarios = int((df_colabs_total["bono_neto"] > 0).sum()) if not df_colabs_total.empty else 0
 
-m1, m2, m3, m4, m5, m6 = st.columns(6)
-m1.metric("Ventas Totales Red (PVP)", f"${total_pvp_red:,.0f}")
-m2.metric("Almacenes con Bono", f"{alms_aplicaron} Sí · {alms_no_aplicaron} No")
-m3.metric("Bono Base (Valor Bono)", f"${total_bono_base_red:,.0f}")
-m4.metric("BONO FINAL Generado", f"${total_bono_final_red:,.0f}")
-m5.metric("Total Descuentos Deducidos", f"-${tot_desc_colabs:,.0f}", delta_color="inverse")
-m6.metric("Gran Total Neto a Pagar", f"${tot_neto_colabs:,.0f}")
-
+tarjetas([
+    ("Ventas Totales Red (PVP)", fmt_compacto(total_pvp_red),
+     f"Exacto: {fmt_cop_dec(total_pvp_red)}"),
+    ("Almacenes con Bono", f"{alms_aplicaron} Sí · {alms_no_aplicaron} No",
+     f"De {alms_aplicaron + alms_no_aplicaron} almacenes evaluados en el mes"),
+    ("Bono Base (Valor Bono)", fmt_compacto(total_bono_base_red),
+     f"Exacto: {fmt_cop_dec(total_bono_base_red)}"),
+    ("BONO FINAL Generado", fmt_compacto(total_bono_final_red),
+     f"Exacto: {fmt_cop_dec(total_bono_final_red)}"),
+    ("Total Descuentos Deducidos", f"-{fmt_compacto(tot_desc_colabs)}",
+     f"Exacto: -{fmt_cop_dec(tot_desc_colabs)} (inventarios + faltas + ausencias + gerencia)"),
+    ("Gran Total Neto a Pagar", fmt_compacto(tot_neto_colabs),
+     f"Exacto: {fmt_cop_dec(tot_neto_colabs)} · {cant_beneficiarios} beneficiarios"),
+])
 st.markdown("---")
 
 # ============================================================

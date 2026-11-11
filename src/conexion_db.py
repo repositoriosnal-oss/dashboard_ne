@@ -397,12 +397,9 @@ def ejecutar_sincronizacion_desde_sap():
                 T0."DocDate" AS "fecha_recibo_pago",
                 T0."DocTotal" AS "total_pago_original",
                 T0."U_NAL_Tipo_Factura" AS "tipo_factura",
-                T0."DocTotal" AS "total_pago_original",
-                T0."U_NAL_Tipo_Factura" AS "tipo_factura",
                 T0."PayNoDoc" AS "pago_a_cuenta",                          -- 🆕 'Y' = Pago a Cuenta
                 COALESCE(T0."U_NAL_Tipo_Pago", '') AS "concepto_anticipo", -- 🆕 Anticipo / Pago a Cartera
                 COALESCE(T0."U_pedAbierto", '') AS "pedido_abierto",       -- 🆕 pedido obligatorio si es Anticipo
-                COALESCE(T5."SeriesName", '') AS "nombre_serie_pago",
                 COALESCE(T5."SeriesName", '') AS "nombre_serie_pago",
                 T0."PrjCode" AS "proyecto",
                 T4."ReconDate" AS "fecha_aplicacion",
@@ -1335,9 +1332,18 @@ def cargar_bonos_anticipos():
         df["pedido_abierto"] = (df["pedido_abierto"].fillna("").astype(str).str.strip()
                                 if "pedido_abierto" in df.columns else pd.Series("", index=df.index))
         
-        _conc = df["concepto_anticipo"].str.upper()
+        # ---- Normalización del concepto: el UDF de SAP tipo lista guarda el
+        # CÓDIGO ('1' = Pago Cartera, '2' = Anticipo), no el texto. Aceptamos ambos.
+        _CON_CODIGO = {"1": "PAGO A CARTERA", "2": "ANTICIPO"}
+        _conc = (df["concepto_anticipo"].astype(str).str.strip().str.upper()
+                 .replace(_CON_CODIGO))
         df["es_anticipo"] = _conc.str.contains("ANTICIPO", na=False)
         df["es_cartera"] = _conc.str.contains("CARTERA", na=False) & ~df["es_anticipo"]
+        # Etiqueta legible para las tablas (conserva el original si es otro valor)
+        df["concepto_anticipo"] = np.where(
+            _conc.str.contains("ANTICIPO", na=False), "Anticipo",
+            np.where(_conc.str.contains("CARTERA", na=False), "Pago a Cartera",
+                     df["concepto_anticipo"].fillna("")))
 
         # ---- Switch por período, evaluado por MES DEL RECIBO ----
         switch = {}
