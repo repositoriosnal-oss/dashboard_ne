@@ -303,6 +303,8 @@ agg_map = {
 if modo != "Almacenes":
     agg_map["Comercial"] = ("nom_empleado", "first")
 
+dfp["pago_nro"] = dfp["pago_nro"].astype(str)
+
 tabla = dfp.groupby(["pago_nro", "estado_comision"], as_index=False).agg(**agg_map).sort_values("pago_nro")
 fila_total = pd.DataFrame([{
     "pago_nro": "Total",
@@ -362,6 +364,7 @@ st.markdown('<div class="section-header"><h3> Anticipos (Aplicaciones Diferidas)
 if ant.empty:
     st.info("Sin anticipos en el rango y filtros seleccionados.")
 else:
+    ant["pago_nro"] = ant["pago_nro"].astype(str)
     grupo = ant.groupby("pago_nro").agg(
         Estado=("estado_anticipo", "first"),
         Pedido=("pedido_abierto", "first"),
@@ -471,6 +474,7 @@ st.markdown('<div class="section-header"><h3>🚩 Control: Pagos en Conciliació
 if dfc.empty:
     st.info("Sin pagos consolidados en el rango y filtros seleccionados.")
 else:
+    dfc["pago_nro"] = dfc["pago_nro"].astype(str)
     tabla_cons = dfc[[
         "pago_nro", "fecha_recibo", "nombre_almacen", "nombre_cliente",
         "pr", "vr_aplicado", "diferencia", "n_facturas", "n_aplicaciones",
@@ -602,6 +606,19 @@ else:
                  f"Exacto: {fmt_cop_dec(pac['liq_estimada'])} · valor_base × 0.8% × % bono del mes del recibo"),
             ])
 
+            if "estado_anticipo" in df_pac.columns:
+                n_sin_tier = int((df_pac["estado_anticipo"].astype(str).str.contains("estimado", na=False)
+                                  & (df_pac["liq_estimada"].fillna(0) == 0)).sum())
+                n_aplicados = int((df_pac["estado_anticipo"].astype(str)
+                                   .str.contains("aplicado", na=False)).sum())
+                if n_sin_tier:
+                    st.caption(f"ℹ️ {n_sin_tier} recibo(s) con switch ON y saldo abierto muestran LIQ estimada $0 "
+                               "porque su almacén no alcanzó tramo de meta en el mes del recibo (misma regla que "
+                               "tendrán al aplicarse: sin tramo, liquidación 0).")
+                if n_aplicados:
+                    st.caption(f"ℹ️ {n_aplicados} recibo(s) ya aplicados: su liquidación vive en 'Liq. aplicada' "
+                               "(estado 'Anticipo aplicado'), nunca en la estimada, para evitar doble conteo.")
+
             faltan = df_pac[df_pac["pedido_faltante"]]
             if not faltan.empty:
                 st.warning(f"⚠️ {len(faltan)} recibo(s) con concepto 'Anticipo' SIN pedido abierto ")
@@ -610,10 +627,14 @@ else:
                 st.warning("Hay recibos a cuenta sin concepto de anticipo: no se clasifican ni como "
                            "anticipo ni como pago a cartera.")
 
-            # 4. Tabla de Detalle (Usando variables dinámicas para evitar KeyErrors)
+
             cols_tabla = ["pago_nro", col_fecha, "nombre_almacen", "nombre_cliente",
-                          col_monto, "monto_final", "concepto_anticipo",
-                          "pedido_abierto", "es_anticipo", "liq_estimada"]
+                        col_monto, "monto_final", "concepto_anticipo",
+                        "pedido_abierto", "es_anticipo",
+                        "estado_anticipo", "pct_bono_mes_recibo", "switch_mismo_mes", "liq_estimada"]
+            for c in ("estado_anticipo", "pct_bono_mes_recibo", "switch_mismo_mes"):
+                if c not in df_pac.columns:
+                    df_pac[c] = None
             
             # Asegurar que las columnas existan para no romper el dataframe
             for c in cols_tabla:
@@ -630,7 +651,10 @@ else:
                     col_monto: "Valor Recibo", "monto_final": "Saldo a Cuenta",
                     "concepto_anticipo": "Concepto (U_NAL_Tipo_Pago)",
                     "pedido_abierto": "Pedido Abierto (U_pedAbierto)",
-                    "es_anticipo": "¿Cuenta como Anticipo?", "liq_estimada": "LIQ Estimada (info)"}),
+                    "es_anticipo": "¿Cuenta como Anticipo?", "liq_estimada": "LIQ Estimada (info)", 
+                    "estado_anticipo": "Estado",
+                    "pct_bono_mes_recibo": "% bono mes recibo",
+                    "switch_mismo_mes": "Switch MM",}),
                 use_container_width=True, hide_index=True, height=400,
                 column_config={
                     "Fecha": st.column_config.DateColumn(format="DD/MM/YYYY"),
@@ -640,6 +664,9 @@ else:
                     "Saldo a Cuenta": st.column_config.NumberColumn(format="$%,.2f"),
                     "LIQ Estimada (info)": st.column_config.NumberColumn(format="$%,.2f"),
                     "¿Cuenta como Anticipo?": st.column_config.CheckboxColumn(),
+                    "Estado": st.column_config.TextColumn(width="medium"),
+                    "% bono mes recibo": st.column_config.NumberColumn(format="%.2f%%"),
+                    "Switch MM": st.column_config.CheckboxColumn(),
                 })
 
 # ============================================================

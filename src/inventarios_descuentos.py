@@ -99,8 +99,8 @@ def auditar_inventario(con, descuento_id, accion, antes, despues, usuario, rol, 
     """), {
         "did": descuento_id,
         "a": accion,
-        "b": json.dumps(antes, default=str) if antes is not None else None,
-        "d": json.dumps(despues, default=str) if despues is not None else None,
+        "b": json.dumps(_limpiar_para_json(antes), default=str) if antes is not None else None,
+        "d": json.dumps(_limpiar_para_json(despues), default=str) if despues is not None else None,
         "u": usuario,
         "rol": rol,
         "nom": nombre_usuario

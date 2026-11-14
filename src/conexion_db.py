@@ -1345,12 +1345,11 @@ def cargar_bonos_anticipos():
             np.where(_conc.str.contains("CARTERA", na=False), "Pago a Cartera",
                      df["concepto_anticipo"].fillna("")))
 
-        # ---- Switch por período, evaluado por MES DEL RECIBO ----
+        # ---- Switch INDEPENDIENTE de anticipos mismo-mes (períodos propios) ----
         switch = {}
         for m in df["fecha_recibo_pago"].dt.to_period("M").unique():
-            rp, _, _ = resolver_periodo_bono(m.start_time.date())
-            switch[m] = bool(rp["liquidar_anticipos_mismo_mes"]) if rp is not None and "liquidar_anticipos_mismo_mes" in rp.index else False
-            
+            switch[m] = resolver_switch_anticipo(m.start_time.date())
+
         df["_mes_rec"] = df["fecha_recibo_pago"].dt.to_period("M")
         df["switch_mismo_mes"] = df["_mes_rec"].map(switch).fillna(False)
 
@@ -1624,6 +1623,14 @@ def bootstrap_bono_variables():
                 creado_por TEXT, creado_en TIMESTAMPTZ DEFAULT now(),
                 actualizado_por TEXT, actualizado_en TIMESTAMPTZ
             );
+            CREATE TABLE IF NOT EXISTS app.bono_anticipos_periodos (
+                id SERIAL PRIMARY KEY,
+                periodo_mes DATE NOT NULL UNIQUE,   -- primer día del mes (2026-11-01)
+                liquidar BOOLEAN NOT NULL DEFAULT TRUE,
+                activo BOOLEAN NOT NULL DEFAULT TRUE,
+                creado_por TEXT, creado_en TIMESTAMPTZ DEFAULT now(),
+                actualizado_por TEXT, actualizado_en TIMESTAMPTZ
+            );        
             CREATE TABLE IF NOT EXISTS app.bono_metas_ventas (
                 id SERIAL PRIMARY KEY,
                 periodo_id INT NOT NULL REFERENCES app.bono_periodos(id) ON DELETE CASCADE,
@@ -1680,6 +1687,28 @@ def bootstrap_bono_variables():
         c.execute(text("""
             ALTER TABLE app.bono_periodos
             ADD COLUMN IF NOT EXISTS meta_ejecutivo_mensual NUMERIC NOT NULL DEFAULT 430000000;
+        """))
+
+             # ---- Migración: esquema viejo (rangos) -> esquema nuevo (lista de meses) ----
+        c.execute(text("""
+            DO $$
+            BEGIN
+                IF EXISTS (
+                    SELECT 1 FROM information_schema.columns
+                    WHERE table_schema='app' AND table_name='bono_anticipos_periodos'
+                      AND column_name='fecha_inicio'
+                ) THEN
+                    DROP TABLE app.bono_anticipos_periodos;
+                    CREATE TABLE app.bono_anticipos_periodos (
+                        id SERIAL PRIMARY KEY,
+                        periodo_mes DATE NOT NULL UNIQUE,
+                        liquidar BOOLEAN NOT NULL DEFAULT TRUE,
+                        activo BOOLEAN NOT NULL DEFAULT TRUE,
+                        creado_por TEXT, creado_en TIMESTAMPTZ DEFAULT now(),
+                        actualizado_por TEXT, actualizado_en TIMESTAMPTZ
+                    );
+                END IF;
+            END $$;
         """))
         
     # ---------- FASE 2: SEMILLA (tablas ya confirmadas y visibles) ----------
@@ -1983,6 +2012,7 @@ def pct_bono_por_mes_almacen():
 
 def _invalidar_caches_bono():
     _cargar_config_bono.clear()
+    _cargar_cfg_anticipos.clear() 
     pct_bono_por_mes_almacen.clear()
     cargar_bonos_pagos.clear()
     cargar_bonos_anticipos.clear()
@@ -2004,6 +2034,114 @@ def resolver_periodo_bono(fecha):
     row = sel.iloc[0]
     pid = int(row["id"])
     return row, met[met["periodo_id"] == pid], esc[esc["periodo_id"] == pid]
+
+
+#============================================================
+#📥 PERÍODOS INDEPENDIENTES DE ANTICIPOS (LISTA DE MESES)
+# Una fila por MES CERRADO (periodo_mes = día 1). Sin rangos:
+# se agrega, se activa/desactiva y se quita de la lista.
+#============================================================
+@st.cache_data(ttl=300, show_spinner=False)
+def _cargar_cfg_anticipos():
+    try:
+        return conn.query(
+            "SELECT * FROM app.bono_anticipos_periodos WHERE activo ORDER BY periodo_mes DESC")
+    except Exception as e:
+        if "no existe la relación" in str(e) or "UndefinedTable" in str(type(e)):
+            return pd.DataFrame(columns=["id", "periodo_mes", "liquidar", "activo"])
+        raise e
+
+
+def resolver_switch_anticipo(fecha) -> bool:
+    """TRUE si el mes de `fecha` está EN LA LISTA con liquidar = TRUE."""
+    cfg = _cargar_cfg_anticipos()
+    if cfg is None or cfg.empty:
+        return False
+    if isinstance(fecha, str):
+        fecha = pd.Timestamp(fecha).date()
+    elif isinstance(fecha, pd.Timestamp):
+        fecha = fecha.date()
+    elif hasattr(fecha, "date"):
+        fecha = fecha.date()
+    mes_target = fecha.replace(day=1)
+    for _, row in cfg.iterrows():
+        row_mes = row["periodo_mes"]
+        if hasattr(row_mes, "date"):
+            row_mes = row_mes.date()
+        elif isinstance(row_mes, pd.Timestamp):
+            row_mes = row_mes.date()
+        if row_mes == mes_target:
+            return bool(row["liquidar"])
+    return False
+
+
+def crear_periodo_anticipos(periodo_mes, liquidar, usuario):
+    """Agrega un mes a la lista (o lo reactiva si estaba quitado)."""
+    pm = _fecha(periodo_mes)
+    if pm is None:
+        raise ValueError("El período (mes) es obligatorio")
+    pm = pm.replace(day=1)
+    with _pg_engine_bono().begin() as c:
+        prev = c.execute(text(
+            "SELECT id, activo FROM app.bono_anticipos_periodos WHERE periodo_mes = :pm"
+        ), {"pm": pm}).mappings().first()
+        if prev is not None:
+            if prev["activo"]:
+                raise ValueError(f"El mes {pm:%B %Y} ya está en la lista.")
+            c.execute(text("""
+                UPDATE app.bono_anticipos_periodos
+                SET activo = TRUE, liquidar = :liq,
+                    actualizado_por = :u, actualizado_en = now()
+                WHERE id = :id"""),
+                {"liq": bool(liquidar), "u": _py(usuario), "id": prev["id"]})
+            pid, accion = prev["id"], "REACTIVAR"
+        else:
+            pid = c.execute(text("""
+                INSERT INTO app.bono_anticipos_periodos (periodo_mes, liquidar, creado_por)
+                VALUES (:pm, :liq, :u) RETURNING id"""),
+                {"pm": pm, "liq": bool(liquidar), "u": _py(usuario)}).scalar()
+            accion = "CREATE"
+    _auditar_bono("bono_anticipos_periodos", pid, accion, None,
+                  {"periodo_mes": str(pm), "liquidar": bool(liquidar)})
+    _invalidar_caches_bono()
+    return int(pid)
+
+
+def actualizar_periodo_anticipos(pid, campos, usuario):
+    """Solo permite cambiar liquidar / activo (la identidad del mes no se edita)."""
+    pid = _entero(pid)
+    campos = {k: _py(v) for k, v in campos.items() if k in {"liquidar", "activo"}}
+    if not campos:
+        raise ValueError("No hay campos para actualizar")
+    cfg = _cargar_cfg_anticipos()
+    antes = cfg[cfg["id"].astype(int) == pid]
+    if antes.empty:
+        raise ValueError("Mes no encontrado en la configuración")
+    antes_dict = antes.iloc[0].to_dict()
+    sets = ", ".join(f"{k} = :{k}" for k in campos)
+    prm = dict(campos); prm["pid"] = pid; prm["u"] = _py(usuario)
+    with _pg_engine_bono().begin() as c:
+        c.execute(text(f"UPDATE app.bono_anticipos_periodos SET {sets}, "
+                       f"actualizado_por = :u, actualizado_en = now() WHERE id = :pid"), prm)
+    _auditar_bono("bono_anticipos_periodos", pid, "UPDATE", antes_dict, campos)
+    _invalidar_caches_bono()
+
+
+def eliminar_periodo_anticipos(pid, usuario):
+    """Quita el mes de la lista (baja lógica: activo=FALSE, conserva auditoría)."""
+    pid = _entero(pid)
+    cfg = _cargar_cfg_anticipos()
+    antes = cfg[cfg["id"].astype(int) == pid]
+    if antes.empty:
+        raise ValueError("Mes no encontrado en la configuración")
+    antes_dict = antes.iloc[0].to_dict()
+    with _pg_engine_bono().begin() as c:
+        c.execute(text("""
+            UPDATE app.bono_anticipos_periodos
+            SET activo = FALSE, actualizado_por = :u, actualizado_en = now()
+            WHERE id = :pid"""), {"u": _py(usuario), "pid": pid})
+    _auditar_bono("bono_anticipos_periodos", pid, "DELETE", antes_dict, None)
+    _invalidar_caches_bono()
 
 
 def _match_intervalo(valor, df, col_min, col_min_inc, col_max, col_max_inc):

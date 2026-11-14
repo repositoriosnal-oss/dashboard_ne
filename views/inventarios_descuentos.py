@@ -31,6 +31,17 @@ from src.inventarios_descuentos import (
 )
 
 # ============================================================
+# MENSAJES FLASH (confirmación que sobrevive al rerun)
+# ============================================================
+def flash(texto: str, tipo: str = "success"):
+    st.session_state["_inv_flash"] = (tipo, texto)
+
+def mostrar_flash():
+    pendiente = st.session_state.pop("_inv_flash", None)
+    if pendiente:
+        getattr(st, pendiente[0])(pendiente[1])
+
+# ============================================================
 # CONFIGURACIÓN DE PÁGINA Y CONTROL DE ACCESO
 # ============================================================
 st.set_page_config(
@@ -41,6 +52,7 @@ st.set_page_config(
 
 st.title("Descuentos por Inventarios — Bono")
 st.markdown("---")
+mostrar_flash()
 
 rol = st.session_state.get("rol_actual", "desconocido")
 usuario = st.session_state.get("usuario_actual", "desconocido")
@@ -121,7 +133,7 @@ with tab_res:
     cant_registros = len(df_filtrado)
 
     k1.metric("Total Descuentos ($)", f"${tot_monto:,.0f}")
-    k2.metric("Personas Afectadas", tot_personas)
+    k2.metric("Total Personas", tot_personas)
     k3.metric("Promedio por Persona", f"${prom_persona:,.0f}")
     k4.metric("Total Novedades / Registros", cant_registros)
 
@@ -151,7 +163,7 @@ with tab_res:
             use_container_width=True,
             hide_index=True,
             column_config={
-                "Total a Descontar ($)": st.column_config.NumberColumn(format="$%d")
+                "Total a Descontar ($)": st.column_config.NumberColumn(format="$%,.2f")
             }
         )
 
@@ -176,7 +188,7 @@ with tab_res:
                 use_container_width=True,
                 hide_index=True,
                 column_config={
-                    "Monto ($)": st.column_config.NumberColumn(format="$%d"),
+                    "Monto ($)": st.column_config.NumberColumn(format="$%,.2f"),
                     "Fecha Registro": st.column_config.DatetimeColumn(format="DD/MM/YYYY HH:mm")
                 }
             )
@@ -210,6 +222,13 @@ with tab_new:
     codigo_alm_filtro = None
     if alm_seleccionado_txt != "-- Todos los Almacenes --":
         codigo_alm_filtro = alm_seleccionado_txt.split(" — ")[0]
+
+    # 🛡️ RLS: un admin_punto solo registra descuentos en su propio almacén
+    if rol == "admin_punto":
+        sap_branch = str(st.session_state.get("sap_branch_code") or "").strip().upper()
+        if sap_branch and codigo_alm_filtro != sap_branch:
+            st.warning(f"Su rol solo puede registrar descuentos en su almacén ({sap_branch}); se fija ese almacén.")
+            codigo_alm_filtro = sap_branch
 
     # Cargar colaboradores según filtro de almacén
     df_cols_filtrados = cargar_colaboradores_disponibles(codigo_alm_filtro)
@@ -249,7 +268,7 @@ with tab_new:
                 "Monto a descontar ($)",
                 min_value=1.0,
                 step=1000.0,
-                format="$%d",
+                format="$%,.2f",
                 required=True,
                 width="medium"
             ),
@@ -284,6 +303,9 @@ with tab_new:
 
         cid = opciones_colaborador[colab_str]
         col_info = MAPA_COL_INFO.get(cid)
+        if rol == "admin_punto" and codigo_alm_filtro and col_info.get("almacen_codigo") not in (None, codigo_alm_filtro):
+            errores_plan.append(f"Fila {i + 1}: {col_info['nombre']} no pertenece a su almacén.")
+            continue
         if col_info is None:
             errores_plan.append(f"Fila {i + 1}: Colaborador no encontrado en el maestro.")
             continue
@@ -308,7 +330,12 @@ with tab_new:
         doc_soporte = str(r["Doc. Soporte / Acta"]).strip() if pd.notna(r["Doc. Soporte / Acta"]) else None
 
         # Almacén al que se asigna el descuento: preferir el del filtro, o el almacén actual de la persona
-        alm_cod_destino = codigo_alm_filtro or col_info.get("almacen_codigo") or "ALM170"
+        alm_cod_destino = codigo_alm_filtro or col_info.get("almacen_codigo")
+        if not alm_cod_destino:
+            errores_plan.append(
+                f"Fila {i + 1} ({col_info['nombre']}): el colaborador no tiene almacén asignado; "
+                "seleccione un almacén en el filtro o corrija el maestro de RRHH.")
+            continue
 
         plan_guardar.append({
             "colaborador_id": cid,
@@ -339,7 +366,7 @@ with tab_new:
             use_container_width=True,
             hide_index=True,
             column_config={
-                "Monto ($)": st.column_config.NumberColumn(format="$%d")
+                "Monto ($)": st.column_config.NumberColumn(format="$%,.2f")
             }
         )
 
@@ -373,7 +400,7 @@ with tab_new:
             con.commit()
 
         st.session_state["inv_save_counter"] = save_key_counter + 1
-        st.success(f"✅ Se registraron y auditaron {len(plan_guardar)} descuento(s) exitosamente.")
+        flash(f"✅ Se registraron y auditaron {len(plan_guardar)} descuento(s) exitosamente.")
         st.rerun()
 
     # ------------------------------------------------------------
@@ -381,6 +408,8 @@ with tab_new:
     # ------------------------------------------------------------
     st.markdown("---")
     st.subheader("2) Carga Masiva desde Excel (.xlsx)")
+    st.caption(f"⚠️ Los registros del archivo se aplicarán al periodo seleccionado arriba: "
+                f"**{dist.etiqueta_mes(mes_nuevo)}**.")
     st.caption("Ideal para importar actas de inventario completas con múltiples colaboradores.")
 
     # Generación de plantilla Excel con hojas y validaciones
@@ -438,7 +467,11 @@ with tab_new:
 
                 alm_cod_in = str(fila.get("codigo_almacen", "")).strip().upper()
                 if alm_cod_in not in LISTA_COD_ALM:
-                    alm_cod_in = col_info.get("almacen_codigo") or "ALM170"
+                    alm_cod_in = col_info.get("almacen_codigo")
+                if not alm_cod_in:
+                    errores_excel.append(
+                        f"Fila {idx + 2} ({col_info['nombre']}): sin almacén válido en la fila ni en el maestro.")
+                    continue
 
                 try:
                     monto_in = float(fila.get("monto", 0))
@@ -493,7 +526,7 @@ with tab_new:
                                 nombre_usuario=nombre_usr
                             )
                         con.commit()
-                    st.success(f"✅ Se importaron y auditaron {len(plan_excel)} descuentos correctamente.")
+                    flash(f"✅ Se importaron y auditaron {len(plan_excel)} descuentos correctamente.")
                     st.rerun()
 
         except Exception as ex_excel:
@@ -555,7 +588,7 @@ with tab_edit:
                                 nombre_usuario=nombre_usr
                             )
                             con.commit()
-                        st.success("Descuento actualizado y auditado correctamente.")
+                        flash("✅ Descuento actualizado y auditado correctamente.")
                         st.rerun()
                     except Exception as ex_up:
                         st.error(f"Error al actualizar: {ex_up}")
@@ -580,7 +613,7 @@ with tab_edit:
                                 nombre_usuario=nombre_usr
                             )
                             con.commit()
-                        st.success("Descuento anulado exitosamente.")
+                        flash("🗑️ Descuento anulado; el movimiento quedó en la auditoría con el motivo.", "warning")
                         st.rerun()
                     except Exception as ex_del:
                         st.error(f"Error al anular: {ex_del}")
@@ -612,20 +645,35 @@ with tab_hist:
     if df_auditoria.empty:
         st.info("No se registran movimientos auditados para el filtro seleccionado.")
     else:
+        # 🆕 4.c) Periodo y monto visibles sin abrir el JSON
+        df_auditoria = df_auditoria.copy()
+        df_auditoria["periodo"] = df_auditoria.apply(
+            lambda r: (r["despues"] or {}).get("periodo_mes") or (r["antes"] or {}).get("periodo_mes") or "",
+            axis=1)
+        df_auditoria["monto"] = df_auditoria.apply(
+            lambda r: (r["despues"] or {}).get("monto") or (r["antes"] or {}).get("monto") or "",
+            axis=1)
+        df_auditoria["monto"] = pd.to_numeric(df_auditoria["monto"], errors="coerce")
+
         st.dataframe(
-            df_auditoria[["id", "fecha", "usuario", "nombre_usuario", "rol", "accion", "descuento_id"]].rename(columns={
+            df_auditoria[["id", "fecha", "usuario", "nombre_usuario", "rol", "accion",
+                          "descuento_id", "periodo", "monto"]].rename(columns={
                 "id": "Log ID",
                 "fecha": "Fecha y Hora",
                 "usuario": "Usuario",
                 "nombre_usuario": "Nombre",
                 "rol": "Rol",
                 "accion": "Acción",
-                "descuento_id": "Descuento ID"
+                "descuento_id": "Descuento ID",
+                "periodo": "Periodo",
+                "monto": "Monto ($)"
             }),
             use_container_width=True,
             hide_index=True,
             column_config={
-                "Fecha y Hora": st.column_config.DatetimeColumn(format="DD/MM/YYYY HH:mm:ss")
+                "Fecha y Hora": st.column_config.DatetimeColumn(format="DD/MM/YYYY HH:mm:ss"),
+                "Periodo": st.column_config.TextColumn(width="small"),
+                "Monto ($)": st.column_config.NumberColumn(format="$%,.2f"),
             }
         )
 

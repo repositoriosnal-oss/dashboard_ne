@@ -9,6 +9,7 @@ de datos: psycopg2 no adapta numpy.int64.
 """
 import io                    # [P2.1] para exportar Excel
 import inspect               # [P2.1] para inspeccionar firmas
+import datetime
 from datetime import date
 from html import escape
 
@@ -16,6 +17,11 @@ import pandas as pd
 import streamlit as st
 
 from src.conexion_db import (
+    crear_periodo_anticipos,
+    actualizar_periodo_anticipos,
+    eliminar_periodo_anticipos,
+    _cargar_cfg_anticipos,
+    cargar_pagos_a_cuenta,
     bootstrap_bono_variables,
     _cargar_config_bono,
     _cargar_periodos_metas,
@@ -267,7 +273,7 @@ def _exportar_configuracion() -> bytes:
     return buf.getvalue()
 
 
-tab_res, tab_new, tab_edit, tab_hist = st.tabs(["Resumen", "Crear período", "Editar período", "Historial"])
+tab_res, tab_new, tab_edit, tab_ant, tab_hist = st.tabs(["Resumen", "Crear período", "Editar período", "Períodos de Anticipos", "Historial"])
 
 # ------------------------------------------------------------
 # 1. RESUMEN
@@ -314,12 +320,6 @@ with tab_res:
     per_display["factor_desc_exentas"] = per_display["factor_desc_exentas"].astype(float) * 100
     per_display["meta_adic_pct"] = per_display["meta_adic_pct"].astype(float) * 100
 
-    if "liquidar_anticipos_mismo_mes" in per.columns:
-        per_display["Liq. anticipos mismo mes"] = ["SÍ" if bool(v) else "no"
-                                                   for v in per["liquidar_anticipos_mismo_mes"]]
-    else:
-        per_display["Liq. anticipos mismo mes"] = "no"
-
     st.dataframe(
         per_display.drop(columns=["id"]).rename(columns={
             "nombre": "Período", "fecha_inicio": "Inicio", "fecha_fin": "Fin",
@@ -332,8 +332,7 @@ with tab_res:
             "Vigente": st.column_config.TextColumn(width="small"),
             "Factor DESC Exentas": st.column_config.NumberColumn(format="%.0f%%"),
             "Base Meta Adicional": st.column_config.NumberColumn(format="$%,.0f"),
-            "Bloque": st.column_config.NumberColumn(format="$%,.0f"),            
-            "Liq. anticipos mismo mes": st.column_config.TextColumn(width="small"),
+            "Bloque": st.column_config.NumberColumn(format="$%,.0f"),      
             "% por Bloque": st.column_config.NumberColumn(format="%.0f%%")})
 
     st.markdown("---")
@@ -517,21 +516,13 @@ with tab_edit:
         e_pct = st.number_input("% por Bloque", min_value=0.0, max_value=1.0,
                                 value=float(periodo_row["meta_adic_pct"]), step=0.01)
 
-        # 🆕 SWITCH DE ANTICIPOS (uno solo, sin duplicados)
-        e_liquidar_ant = st.toggle(
-            "Liquidar anticipos estimados (mismo mes)",
-            value=bool(periodo_row.get("liquidar_anticipos_mismo_mes", False)),
-            help="Si está ON, los recibos 'Pago a Cuenta' con concepto 'Anticipo' y saldo abierto "
-                 "suman una liquidación ESTIMADA al mes del recibo. Al aplicarse en SAP pasan "
-                 "solos a liquidación real (nunca se suman las dos).")
-
+        
         guardar_gen = st.form_submit_button("Guardar parámetros generales", type="primary")
         if guardar_gen:
             ejecutar(lambda: actualizar_periodo(periodo_id, {
                 "nombre": e_nombre, "fecha_inicio": e_fini, "fecha_fin": e_ffin,
                 "factor_desc_exentas": e_factor, "meta_adic_base": e_base,
-                "meta_adic_bloque": e_bloque, "meta_adic_pct": e_pct,
-                "liquidar_anticipos_mismo_mes": e_liquidar_ant}, usuario),
+                "meta_adic_bloque": e_bloque, "meta_adic_pct": e_pct,}, usuario),
                 "Parámetros generales actualizados.")
 
     st.markdown("---")
@@ -680,6 +671,116 @@ with tab_edit:
                 ejecutar(lambda: eliminar_periodo_escala(pid_e, usuario), "Período de escala eliminado y registrado en el historial.")
 
 
+#------------------------------------------------------------
+# 3B. PERÍODOS DE ANTICIPOS (LISTA DE MESES CERRADOS)
+#------------------------------------------------------------
+with tab_ant:
+    st.subheader("Períodos de liquidación de anticipos (mes a mes)")
+    st.caption(
+        "Lista de MESES CERRADOS en los que los recibos 'Pago a Cuenta' (ORCT.PayNoDoc = 'Y') "
+        "con concepto Anticipo y saldo abierto suman una liquidación ESTIMADA al mes del recibo. "
+        "Agrega o quita meses según decida Gerencia. Los meses fuera de la lista (o con el switch "
+        "en OFF) solo tienen seguimiento: no suman al Valor Bono ni al Gran Total.")
+    cfg_ant = _cargar_cfg_anticipos()
+
+    # ---- Lista de meses configurados ----
+    if cfg_ant.empty:
+        st.info("Sin meses configurados: la liquidación estimada está DESACTIVADA para todos los meses.")
+    else:
+        df_mostrar = cfg_ant.copy()
+        df_mostrar["periodo_mes"] = pd.to_datetime(df_mostrar["periodo_mes"])
+        df_mostrar["Mes"] = df_mostrar["periodo_mes"].dt.strftime("%B %Y").str.capitalize()
+        df_mostrar["Estado"] = df_mostrar["liquidar"].apply(
+            lambda x: "✅ LIQUIDAR estimada" if x else "⏸️ Solo seguimiento")
+        st.dataframe(
+            df_mostrar[["Mes", "Estado"]].rename(
+                columns={"Mes": "Período (mes cerrado)", "Estado": "Acción configurada"}),
+            use_container_width=True, hide_index=True,
+            column_config={
+                "Período (mes cerrado)": st.column_config.TextColumn(width="medium"),
+                "Acción configurada": st.column_config.TextColumn(width="medium")})
+
+    # ---- Agregar un mes a la lista ----
+    with st.expander("➕ Agregar un mes a la lista", expanded=cfg_ant.empty):
+        with st.form("form_new_ant_mm"):
+            c1, c2 = st.columns(2)
+            anios = list(range(2025, 2028))
+            anio_sel = c1.selectbox("Año", options=anios,
+                                    index=anios.index(date.today().year)
+                                    if date.today().year in anios else 0)
+            mes_sel_num = c2.selectbox(
+                "Mes", options=list(range(1, 13)),
+                format_func=lambda m: pd.Timestamp(f"2000-{m:02d}-01").strftime("%B").capitalize())
+            ant_liq = st.checkbox("Liquidar anticipos estimados en este mes", value=True)
+            if st.form_submit_button("Agregar mes", type="primary"):
+                periodo_mes_dt = date(anio_sel, mes_sel_num, 1)
+                ejecutar(lambda: crear_periodo_anticipos(periodo_mes_dt, ant_liq, usuario),
+                         f"Mes {periodo_mes_dt:%B %Y} agregado a la configuración.")
+
+    # ---- Activar / desactivar (form) + quitar mes (fuera del form) ----
+    if not cfg_ant.empty:
+        st.markdown("---")
+        st.subheader("Activar, desactivar o quitar meses")
+        opciones_meses = {
+            f"{pd.Timestamp(r['periodo_mes']):%B %Y} "
+            f"({'✅ Liquidar' if r['liquidar'] else '⏸️ Solo seguimiento'})": int(r["id"])
+            for _, r in cfg_ant.iterrows()
+        }
+        pid_ant_sel = st.selectbox("Mes configurado", list(opciones_meses.keys()), key="sel_ant_mm")
+        pid_ant = opciones_meses[pid_ant_sel]
+        row_ant = cfg_ant[cfg_ant["id"].astype(int) == pid_ant].iloc[0]
+
+        # Switch ON/OFF dentro del form (como ya funciona hoy)
+        with st.form(f"form_edit_ant_mm_{pid_ant}_{ver}"):
+            e_ant_liq = st.toggle(
+                "Liquidar (ON) / Solo seguimiento (OFF)",
+                value=bool(row_ant["liquidar"]),
+                help="ON: los recibos Pago a Cuenta con concepto Anticipo y saldo abierto de ese mes "
+                     "suman liquidación estimada al Valor Bono del mes.")
+            if st.form_submit_button("💾 Guardar cambios", type="primary"):
+                ejecutar(lambda: actualizar_periodo_anticipos(pid_ant, {"liquidar": e_ant_liq}, usuario),
+                         "Configuración del mes actualizada.")
+
+        # 🗑️ Quitar el mes: FUERA del form para que el checkbox habilite el botón en vivo
+        with st.expander("🗑️ Quitar este mes de la lista"):
+            st.warning("Al quitarlo, ese mes vuelve a 'solo seguimiento' (sin liquidación estimada). "
+                       "Los recibos y el historial NO se borran; puedes volver a agregar el mes "
+                       "cuando quieras desde '➕ Agregar un mes a la lista'.")
+            conf_ant = st.checkbox(
+                f"Confirmo quitar {pd.Timestamp(row_ant['periodo_mes']):%B %Y} de la lista",
+                key=f"conf_del_ant_mm_{pid_ant}")
+            if st.button("🗑️ Quitar mes", type="secondary", disabled=not conf_ant,
+                         key=f"btn_del_ant_mm_{pid_ant}"):
+                ejecutar(lambda: eliminar_periodo_anticipos(pid_ant, usuario),
+                         f"Mes {pd.Timestamp(row_ant['periodo_mes']):%B %Y} quitado de la lista.")
+
+    # ---- Impacto actual (solo lectura) ----
+    with st.expander("🔍 Ver impacto actual en recibos (solo lectura)"):
+        pac_df = cargar_pagos_a_cuenta()
+        if pac_df.empty:
+            st.info("Sin recibos 'Pago a Cuenta' sincronizados.")
+        else:
+            cols_mostrar = ["pago_nro", "fecha_recibo_pago", "nombre_almacen", "concepto_anticipo",
+                            "monto_final", "estado_anticipo", "pct_bono_mes_recibo", "liq_estimada"]
+            cols_existentes = [c for c in cols_mostrar if c in pac_df.columns]
+            st.dataframe(
+                pac_df[cols_existentes]
+                .rename(columns={"pago_nro": "Recibo", "fecha_recibo_pago": "Fecha recibo",
+                                 "nombre_almacen": "Almacén", "concepto_anticipo": "Concepto",
+                                 "monto_final": "Saldo/valor ($)", "estado_anticipo": "Estado",
+                                 "pct_bono_mes_recibo": "% bono mes recibo",
+                                 "liq_estimada": "Liq. estimada ($)"}),
+                use_container_width=True, hide_index=True, height=320,
+                column_config={
+                    "Fecha recibo": st.column_config.DateColumn(format="DD/MM/YYYY"),
+                    "Saldo/valor ($)": st.column_config.NumberColumn(format="$%,.2f"),
+                    "% bono mes recibo": st.column_config.NumberColumn(format="%.2f%%"),
+                    "Liq. estimada ($)": st.column_config.NumberColumn(format="$%,.2f")})
+            st.caption("Un recibo suma liquidación estimada solo si: es Pago a Cuenta, concepto Anticipo, "
+                       "tiene saldo abierto, su mes está EN LA LISTA como LIQUIDAR, y el almacén alcanzó "
+                       "tramo de meta en el mes del recibo.")
+
+            
 # ------------------------------------------------------------
 # 4. HISTORIAL
 # ------------------------------------------------------------
