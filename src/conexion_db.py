@@ -1615,6 +1615,8 @@ def bootstrap_bono_variables():
 
     # ---------- FASE 1: DDL (se confirma al salir del bloque) ----------
     with eng.begin() as c:
+        c.execute(text("DROP VIEW IF EXISTS app.bono_periodos_metas CASCADE;"))
+        c.execute(text("DROP VIEW IF EXISTS app.bono_periodos_escala CASCADE;"))
         c.execute(text("""
             CREATE TABLE IF NOT EXISTS app.bono_periodos (
                 id SERIAL PRIMARY KEY,
