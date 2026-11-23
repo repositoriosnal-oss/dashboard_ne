@@ -12,6 +12,24 @@ from datetime import date, datetime
 import pandas as pd
 from sqlalchemy import text
 from src.conexion_db import conn
+import math
+
+
+def _limpiar_para_json(obj):
+    """NaN / NaT / pd.NA → None para que json.dumps genere 'null'
+    (el único nulo válido para el tipo jsonb de PostgreSQL)."""
+    if isinstance(obj, dict):
+        return {k: _limpiar_para_json(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_limpiar_para_json(v) for v in obj]
+    if isinstance(obj, float) and math.isnan(obj):
+        return None
+    try:
+        if pd.isna(obj):
+            return None
+    except (ValueError, TypeError):
+        pass
+    return obj
 
 # Roles autorizados para ingresar y operar en el módulo
 ROLES_INVENTARIOS_CARGUE = ["admin", "gerente", "inventarios", "compras", "admin_punto"]

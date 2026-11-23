@@ -270,16 +270,17 @@ def calcular_tabla_liquidacion_almacenes(desde_d, hasta_d, periodo_mes_str):
     ).drop(columns=["nombre_almacen"], errors="ignore")
     t3["Valor_Bono"] = t3["Valor_Bono"].fillna(0.0)
 
+    # 🆕 % y descuento de exentas (idéntico a Conciliación Bono, ya auditado)
+    factor_ex = float(periodo_general["factor_desc_exentas"])
+    t3["Pct_Exentas"] = np.where(t3["Precio_Total_PVP"] != 0,
+                                 t3["total_exentas"] / t3["Precio_Total_PVP"], 0.0)
+    t3["Desc_Exentas"] = t3["Pct_Exentas"] * factor_ex
+
     # Escala de rentabilidad
     r = t3["Pct_Rent_Costo"] / 100.0
     t3["Pct_Bono"] = r.apply(lambda rent: aplicar_escala_rent(rent, rangos_escala))
-
-    # Bono Total
-    t3["Bono_Total"] = np.where(
-        t3["Pct_Bono"] >= 0,
-        t3["Valor_Bono"] * t3["Pct_Bono"],
-        t3["Valor_Bono"] + (t3["Valor_Bono"] * t3["Pct_Bono"]),
-    )
+    # Directriz Gerencia: multiplica directo; el negativo se muestra negativo
+    t3["Bono_Total"] = t3["Valor_Bono"] * t3["Pct_Bono"]
 
     # Meta Adicional
     meta_base = float(periodo_general["meta_adic_base"])
@@ -310,6 +311,8 @@ MAP_LIQ_ALM = {
         "valor_bono": float(r["Valor_Bono"]),
         "bono_total": float(r["Bono_Total"]),
         "pct_adic": float(r["Pct_Meta_Adicional"]),
+        "pct_rent": float(r["Pct_Bono"]),
+        "pct_desc_exentas": float(r["Desc_Exentas"]),
         "bono_final": float(r["Bono_Final"]),
     }
     for _, r in df_liq_almacenes.iterrows()
@@ -325,6 +328,56 @@ ASIGNACIONES = dist.cargar_asignaciones(conn)
 DESCUENTOS_INV = reparto.cargar_descuentos_inventarios_mes(conn, mes_date)
 NOVEDADES_RRHH, CONFIG_FALTAS = reparto.cargar_novedades_rrhh_mes(conn, mes_date)
 NOVEDADES_ADMIN = reparto.cargar_novedades_admin_mes(conn, mes_date)
+
+# ============================================================
+# 🧮 CASCADA DE LIQUIDACIÓN POR COLABORADOR
+# Base → Rentabilidad → Meta Adic → Exentas → Inventarios
+#      → Faltas → Ausencias (base reducida) → Gerencia → Neto
+# ============================================================
+def recalcular_cascada_colaboradores(df: pd.DataFrame, map_liq: dict) -> pd.DataFrame:
+    if df.empty:
+        return df
+    out = df.copy()
+
+    def _liq(r):
+        return (map_liq.get(r["almacen_nombre"])
+                or map_liq.get(r["almacen_codigo"]) or {})
+
+    liq = out.apply(_liq, axis=1)
+    pct_rent = liq.apply(lambda d: float(d.get("pct_rent", 0.0)))
+    pct_adic = liq.apply(lambda d: float(d.get("pct_adic", 0.0)))
+    pct_ex = liq.apply(lambda d: float(d.get("pct_desc_exentas", 0.0)))
+    aplica = liq.apply(lambda d: bool(d.get("aplica", False)))
+
+    def _col(name):
+        return (pd.to_numeric(out[name], errors="coerce").fillna(0.0)
+                if name in out.columns else pd.Series(0.0, index=out.index))
+
+    pf, pa, pg, inv = _col("pct_faltas"), _col("pct_ausencias"), _col("pct_admin"), _col("desc_inv_pesos")
+
+    out["pct_rent_disp"] = pct_rent * 100.0
+    out["bono_rent"] = out["bono_base"] * pct_rent
+    out["pct_adic_disp"] = np.where(aplica, pct_adic * 100.0, 0.0)
+    out["bono_bruto"] = np.where(aplica, out["bono_rent"] * (1.0 + pct_adic), 0.0)
+
+    out["pct_exentas_disp"] = pct_ex * 100.0
+    hay_bono = out["bono_bruto"] > 0
+    out["desc_exentas_pesos"] = np.where(hay_bono, out["bono_bruto"] * pct_ex, 0.0)
+    out["desc_inv_pesos"] = inv
+    out["desc_faltas_pesos"] = np.where(hay_bono, out["bono_bruto"] * pf / 100.0, 0.0)
+    base_aus = (out["bono_bruto"] - out["desc_exentas_pesos"] - inv).clip(lower=0.0)
+    out["desc_ausencias_pesos"] = base_aus * pa / 100.0
+    out["desc_admin_pesos"] = np.where(hay_bono, out["bono_bruto"] * pg / 100.0, 0.0)
+
+    out["total_descuentos"] = (out["desc_exentas_pesos"] + inv + out["desc_faltas_pesos"]
+                               + out["desc_ausencias_pesos"] + out["desc_admin_pesos"])
+    out["bono_neto"] = (out["bono_bruto"] - out["total_descuentos"]).clip(lower=0.0)
+    out["saldo_pendiente"] = (out["total_descuentos"] - out["bono_bruto"]).clip(lower=0.0)
+    out["estado"] = np.where(
+        ~aplica, "No aplica meta",
+        np.where(out["bono_neto"] > 0, "✅ Pagar",
+                 np.where(out["saldo_pendiente"] > 0, "⚠️ Saldo pendiente", "Sin bono")))
+    return out
 
 # ============================================================
 # CONSOLIDACIÓN GENERAL DE COLABORADORES
@@ -370,6 +423,7 @@ for alm in ALMACENES_DB:
     todos_los_colaboradores.extend(filas_alm)
 
 df_colabs_total = pd.DataFrame(todos_los_colaboradores)
+df_colabs_total = recalcular_cascada_colaboradores(df_colabs_total, MAP_LIQ_ALM)
 
 # Filtrado según selector
 if alm_sel_label != TODOS_ALMS:
@@ -437,70 +491,83 @@ with tab_reparto_persona:
         "(Inventarios $, Faltas %, Ausencias % y Novedades Gerencia %) para obtener el **Bono Neto a Pagar**."
     )
 
+    # 🆕 Aviso: almacenes sin colaboradores asignados en el mes
+    alms_con_gente = set(df_colabs_total["almacen_codigo"]) if not df_colabs_total.empty else set()
+    alms_sin_gente = [a["nombre"] for a in ALMACENES_DB
+                      if a.get("modo_bono", dist.MODO_PORCENTAJE) != dist.MODO_INDIVIDUAL
+                      and a["codigo"] not in alms_con_gente]
+    if alms_sin_gente:
+        st.caption("ℹ️ Tabla por colaborador: solo aparecen almacenes con personas asignadas en el mes. "
+                   "Sin colaboradores asignados: " + ", ".join(alms_sin_gente) +
+                   ". Su Valor Bono y cumplimiento se consultan en 'Resumen y Cumplimiento por Almacén'.")
+
     if df_filtrado.empty:
         st.info("No se encontraron registros de colaboradores para los filtros seleccionados.")
     else:
         # Fila de Totales Consolidados para la vista
         fila_totales = pd.DataFrame([{
-            "almacen_nombre": "TOTALES",
-            "cargo": "—",
-            "nombre": f"{len(df_filtrado)} colaboradores",
-            "cedula": "—",
-            "pct_bolsa_cargo": None,
-            "pct_efectivo": None,
+            "almacen_nombre": "TOTALES", "cargo": "—",
+            "nombre": f"{len(df_filtrado)} colaboradores", "cedula": "—",
+            "pct_efectivo": float(df_filtrado["pct_efectivo"].sum()),
             "bono_base": float(df_filtrado["bono_base"].sum()),
-            "bono_adicional": float(df_filtrado["bono_adicional"].sum()),
+            "pct_rent_disp": None,
+            "bono_rent": float(df_filtrado["bono_rent"].sum()),
+            "pct_adic_disp": None,
             "bono_bruto": float(df_filtrado["bono_bruto"].sum()),
+            "pct_exentas_disp": None,
+            "desc_exentas_pesos": float(df_filtrado["desc_exentas_pesos"].sum()),
             "desc_inv_pesos": float(df_filtrado["desc_inv_pesos"].sum()),
-            "pct_faltas": None,
             "desc_faltas_pesos": float(df_filtrado["desc_faltas_pesos"].sum()),
-            "pct_ausencias": None,
             "desc_ausencias_pesos": float(df_filtrado["desc_ausencias_pesos"].sum()),
             "pct_admin": None,
             "desc_admin_pesos": float(df_filtrado["desc_admin_pesos"].sum()),
             "total_descuentos": float(df_filtrado["total_descuentos"].sum()),
             "bono_neto": float(df_filtrado["bono_neto"].sum()),
-            "saldo_pendiente": float(df_filtrado["saldo_pendiente"].sum()),
-            "estado": f"{cant_beneficiarios} a pagar"
+            "estado": f"{int((df_filtrado['bono_neto'] > 0).sum())} a pagar",
         }])
-
         cols_orden = [
             "almacen_nombre", "cargo", "nombre", "cedula",
-            "pct_bolsa_cargo", "pct_efectivo",
-            "bono_base", "bono_adicional", "bono_bruto",
-            "desc_inv_pesos", "desc_faltas_pesos", "desc_ausencias_pesos", "desc_admin_pesos",
-            "total_descuentos", "bono_neto", "estado"
+            "pct_efectivo", "bono_base",
+            "pct_rent_disp", "bono_rent",
+            "pct_adic_disp", "bono_bruto",
+            "pct_exentas_disp", "desc_exentas_pesos",
+            "desc_inv_pesos", "desc_faltas_pesos", "desc_ausencias_pesos",
+            "pct_admin", "desc_admin_pesos",
+            "total_descuentos", "bono_neto", "estado",
         ]
-
         df_tabla_final = pd.concat([df_filtrado[cols_orden], fila_totales[cols_orden]], ignore_index=True)
-
         st.dataframe(
             df_tabla_final.rename(columns={
-                "almacen_nombre": "Almacén",
-                "cargo": "Cargo",
-                "nombre": "Colaborador",
-                "cedula": "Cédula",
-                "pct_bolsa_cargo": "% Bolsa Cargo",
+                "almacen_nombre": "Almacén", "cargo": "Cargo",
+                "nombre": "Colaborador", "cedula": "Cédula",
                 "pct_efectivo": "% Efectivo",
                 "bono_base": "Valor Bono (Base)",
-                "bono_adicional": "Adic. Meta",
-                "bono_bruto": "BONO FINAL (Bruto)",
+                "pct_rent_disp": "% Rent (escala)",
+                "bono_rent": "Bono c/ Rentabilidad ($)",
+                "pct_adic_disp": "% Meta Adicional",
+                "bono_bruto": "Bono Final (Bruto) ($)",
+                "pct_exentas_disp": "% Desc. Exentas",
+                "desc_exentas_pesos": "Desc. Exentas ($)",
                 "desc_inv_pesos": "Desc. Inventarios ($)",
                 "desc_faltas_pesos": "Desc. Faltas ($)",
                 "desc_ausencias_pesos": "Desc. Ausencias ($)",
+                "pct_admin": "% Gerencia",
                 "desc_admin_pesos": "Desc. Gerencia ($)",
                 "total_descuentos": "Total Deducciones ($)",
                 "bono_neto": "BONO NETO A PAGAR ($)",
-                "estado": "Estado"
+                "estado": "Estado",
             }),
-            use_container_width=True,
-            hide_index=True,
+            use_container_width=True, hide_index=True,
             column_config={
-                "% Bolsa Cargo": st.column_config.NumberColumn(format="%.2f%%"),
                 "% Efectivo": st.column_config.NumberColumn(format="%.2f%%"),
+                "% Rent (escala)": st.column_config.NumberColumn(format="%.2f%%"),
+                "% Meta Adicional": st.column_config.NumberColumn(format="%.2f%%"),
+                "% Desc. Exentas": st.column_config.NumberColumn(format="%.2f%%"),
+                "% Gerencia": st.column_config.NumberColumn(format="%.2f%%"),
                 "Valor Bono (Base)": st.column_config.NumberColumn(format="$%,.2f"),
-                "Adic. Meta": st.column_config.NumberColumn(format="$%,.2f"),
-                "BONO FINAL (Bruto)": st.column_config.NumberColumn(format="$%,.2f"),
+                "Bono c/ Rentabilidad ($)": st.column_config.NumberColumn(format="$%,.2f"),
+                "Bono Final (Bruto) ($)": st.column_config.NumberColumn(format="$%,.2f"),
+                "Desc. Exentas ($)": st.column_config.NumberColumn(format="$%,.2f"),
                 "Desc. Inventarios ($)": st.column_config.NumberColumn(format="$%,.2f"),
                 "Desc. Faltas ($)": st.column_config.NumberColumn(format="$%,.2f"),
                 "Desc. Ausencias ($)": st.column_config.NumberColumn(format="$%,.2f"),
@@ -509,6 +576,9 @@ with tab_reparto_persona:
                 "BONO NETO A PAGAR ($)": st.column_config.NumberColumn(format="$%,.2f"),
             }
         )
+        st.caption("ℹ️ % Efectivo suma 100% por cada almacén (con todos los almacenes verás N×100%). "
+                   "Desc. Ausencias se calcula sobre (Bruto − Exentas − Inventarios); "
+                   "Faltas y Gerencia sobre el Bruto. El CSV descargable incluye todas las columnas.")
 
         # Botón de Descarga
         csv_colabs = df_tabla_final.to_csv(index=False).encode("utf-8-sig")

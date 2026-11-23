@@ -10,6 +10,20 @@ st.set_page_config(
 )
 
 # ============================================================
+# 🌐 Ruta pública: indicadores de mercado (sin credenciales)
+#    Debe ir ANTES del control de autenticación.
+#    Link: http://TU_SERVIDOR:8501/?vista=indicadores
+# ============================================================
+if st.query_params.get("vista") in ("metales", "indicadores"):
+    st.navigation([
+        st.Page("views_public/indicadores_mercado.py",  
+                title="Metales y TRM",
+                icon=":material/candlestick_chart:")
+    ], position="hidden").run()
+    st.stop()
+
+
+# ============================================================
 # RUTA DEL LOGO DE LA EMPRESA
 # ============================================================
 RUTA_LOGO = Path(__file__).parent / "logo_empresa.png"

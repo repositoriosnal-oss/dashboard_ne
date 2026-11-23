@@ -1561,8 +1561,14 @@ SEED_PERIODOS = [
 ]
 
 
+@st.cache_resource(show_spinner=False)
 def _pg_engine_bono():
-    return create_engine(CADENA_CONEXION_PG)
+    """Un solo engine compartido para auditoría + CRUD, con pool acotado y reciclado."""
+    return create_engine(
+        CADENA_CONEXION_PG,
+        pool_size=5, max_overflow=5, pool_timeout=30,
+        pool_pre_ping=True, pool_recycle=1800,
+    )
 
 
 import math
@@ -2364,6 +2370,12 @@ def guardar_decision_contabilidad(periodo_mes, tipo_registro, nombre_almacen,
                                "decision": decision, "valor_corregido": valor_corregido,
                                "observacion": observacion}, default=str),
         })
+    # 🔄 La decisión cambia el descuento por exentas → refrescar todo lo que depende de ella.
+    # Se hace DESPUÉS del commit para que las nuevas consultas vean el dato ya confirmado.
+    try:
+        st.cache_data.clear()
+    except Exception:
+        pass
 
 
 def obtener_decision_contabilidad(periodo_mes, nombre_almacen, nombre_comercial=""):
@@ -2377,7 +2389,7 @@ def obtener_decision_contabilidad(periodo_mes, nombre_almacen, nombre_comercial=
         ORDER BY fecha_decision DESC
         LIMIT 1
     """
-    df = conn.query(q, params={"pm": periodo_mes, "na": nombre_almacen, "nc": nombre_comercial})
+    df = conn.query(q, params={"pm": periodo_mes, "na": nombre_almacen, "nc": nombre_comercial}, ttl=0)
     if df.empty:
         return None
     row = df.iloc[0]
@@ -2393,33 +2405,33 @@ def obtener_decisiones_por_periodo(periodo_mes):
         WHERE periodo_mes = :pm
         ORDER BY tipo_registro, nombre_almacen, nombre_comercial, fecha_decision DESC
     """
-    return conn.query(q, params={"pm": periodo_mes})
+    return conn.query(q, params={"pm": periodo_mes}, ttl=0)
 
 def obtener_exentas_auditadas_por_almacen(mes_periodo: str):
-    """
-    Devuelve {almacen: valor_exentas_auditado}.
-    Si hay decisión 'corregido' → usa valor_corregido.
-    Si no (pendiente/aprobado) → usa el total_exentas calculado.
-    Para EJECUTIVOS COMERCIALES suma el valor auditado de cada comercial.
-    """
+    """{almacen: valor_exentas_auditado} con una sola consulta de decisiones (sin N+1)."""
     resultado = {}
-
-    # --- Almacenes (excepto EJECOM) ---
     df_alm = cargar_exentas_por_almacen(mes_periodo)
+    df_ej = cargar_exentas_por_comercial_ejecom(mes_periodo)
+    df_dec = conn.query("""
+        SELECT tipo_registro, nombre_almacen, nombre_comercial, valor_corregido
+        FROM app.contabilidad_decisiones_exentas
+        WHERE periodo_mes = :pm AND decision = 'corregido' AND valor_corregido IS NOT NULL
+    """, params={"pm": mes_periodo}, ttl=0)
+    dec_alm, dec_ej = {}, {}
+    for _, r in df_dec.iterrows():
+        if r["tipo_registro"] == "comercial":
+            dec_ej[(r["nombre_almacen"], r["nombre_comercial"])] = float(r["valor_corregido"])
+        else:
+            dec_alm[r["nombre_almacen"]] = float(r["valor_corregido"])
     for _, row in df_alm.iterrows():
         alm = row["nombre_almacen"]
         if alm == "EJECUTIVOS COMERCIALES":
             continue
-        dec = obtener_decision_contabilidad(mes_periodo, alm, "")
-        resultado[alm] = float(dec) if dec is not None else float(row["total_exentas"])
-
-    # --- Ejecutivos Comerciales: suma auditada por comercial ---
-    df_ej = cargar_exentas_por_comercial_ejecom(mes_periodo)
+        resultado[alm] = dec_alm.get(alm, float(row["total_exentas"] or 0.0))
     total_ej = 0.0
     for _, row in df_ej.iterrows():
-        dec = obtener_decision_contabilidad(mes_periodo, "EJECUTIVOS COMERCIALES", row["nombre_vendedor"])
-        total_ej += float(dec) if dec is not None else float(row["total_exentas"])
+        clave = ("EJECUTIVOS COMERCIALES", row["nombre_vendedor"])
+        total_ej += dec_ej.get(clave, float(row["total_exentas"] or 0.0))
     if not df_ej.empty:
         resultado["EJECUTIVOS COMERCIALES"] = total_ej
-
     return resultado

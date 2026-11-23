@@ -39,7 +39,7 @@ ESTADOS = ["Pendiente", "Aprobado", "Corregido"]
 rng = conn.query("""
     SELECT MIN(fecha_contabilizacion)::date AS ini, MAX(fecha_contabilizacion)::date AS fin
     FROM sap_raw.ventas_netas
-""")
+""", ttl=600)
 if not rng.empty and rng.iloc[0]["ini"] is not None:
     ini = dist.inicio_mes(rng.iloc[0]["ini"])
     fin = max(dist.inicio_mes(rng.iloc[0]["fin"]), MES_ACTUAL)
@@ -61,7 +61,7 @@ def leer_decision(pm, almacen, comercial=""):
         SELECT decision, valor_corregido FROM app.contabilidad_decisiones_exentas
         WHERE periodo_mes = :pm AND nombre_almacen = :na AND nombre_comercial = :nc
         ORDER BY fecha_decision DESC LIMIT 1
-    """, params={"pm": pm, "na": almacen, "nc": comercial})
+    """, params={"pm": pm, "na": almacen, "nc": comercial}, ttl=0)  
     if df.empty:
         return "Pendiente", None
     d = df.iloc[0]
@@ -111,6 +111,15 @@ def tabla_ejecutivos(mes_str, df_ej):
                      "valor_final": val if (est == "Corregido" and val is not None) else ex})
     return pd.DataFrame(rows)
 
+def _pct100(df: pd.DataFrame) -> pd.DataFrame:
+    """Copia para MOSTRAR: convierte la fracción (0,27) en porcentaje (27).
+    No altera el cálculo ni lo que se guarda en la base de datos."""
+    if df is None or df.empty:
+        return df
+    out = df.copy()
+    if "pct_exentas" in out.columns:
+        out["pct_exentas"] = pd.to_numeric(out["pct_exentas"], errors="coerce") * 100.0
+    return out
 
 CFG_NUM = {
     "PVP Total": st.column_config.NumberColumn(format="$%,.2f"),
@@ -160,7 +169,7 @@ with tab_res:
 
     st.markdown("##### Descuento por almacén")
     st.dataframe(
-        df_alm[["nombre", "pvp_total", "total_exentas", "pct_exentas", "estado", "valor_final"]]
+        _pct100(df_alm)[["nombre", "pvp_total", "total_exentas", "pct_exentas", "estado", "valor_final"]]
         .rename(columns={"nombre": "Almacén", "pvp_total": "PVP Total",
                          "total_exentas": "Total Exentas ($)", "pct_exentas": "% Exentas",
                          "estado": "Estado", "valor_final": "Valor Final ($)"}),
@@ -171,14 +180,14 @@ with tab_res:
         st.info("Sin ejecutivos comerciales con ventas en el periodo.")
     else:
         st.dataframe(
-            df_ejc[["nombre", "cedula", "pvp_total", "total_exentas", "pct_exentas", "estado", "valor_final"]]
+            _pct100(df_ejc)[["nombre", "cedula", "pvp_total", "total_exentas", "pct_exentas", "estado", "valor_final"]]
             .rename(columns={"nombre": "Comercial", "cedula": "Cédula", "pvp_total": "PVP Total",
                              "total_exentas": "Total Exentas ($)", "pct_exentas": "% Exentas",
                              "estado": "Estado", "valor_final": "Valor Final ($)"}),
             use_container_width=True, hide_index=True,
             column_config={"Cédula": st.column_config.TextColumn(width="small"), **CFG_NUM})
     st.download_button("Descargar resumen (CSV)",
-                       pd.concat([df_alm, df_ejc]).to_csv(index=False).encode("utf-8-sig"),
+                       pd.concat([_pct100(df_alm), _pct100(df_ejc)]).to_csv(index=False).encode("utf-8-sig"),
                        file_name=f"exentas_{mes_str}.csv", mime="text/csv")
 
 # ------------------------------------------------------------
@@ -191,6 +200,10 @@ with tab_edit:
     st.caption("Puedes aprobar o corregir cualquier periodo, cerrado o en curso. Si el periodo aún "
                "no tiene ventas sincronizadas, el valor del sistema es 0 y tu decisión queda como "
                "primer registro del periodo.")
+
+    _aviso = st.session_state.pop("_ce_flash", None)
+    if _aviso:
+        st.success(_aviso)
 
     def pintar_editor(df, tipo, clave, titulo, mes_str, es_ejecutivo=False):
         st.subheader(titulo)
@@ -249,7 +262,11 @@ with tab_edit:
             if errs:
                 st.error("Estos cambios NO se guardaron:\n" + "\n".join(errs))
             if guardadas:
-                st.success(f"{guardadas} decisión(es) guardadas y auditadas.")
+                # Resetear los widgets del editor para que relean el valor confirmado de la BD
+                for nom in edits:
+                    for pref in ("est_", "val_"):
+                        st.session_state.pop(f"{pref}{tipo}_{mes_str}_{nom}", None)
+                st.session_state["_ce_flash"] = f"{guardadas} decisión(es) guardadas y auditadas."
                 st.rerun()
             elif not errs:
                 st.info("Sin cambios que guardar.")
