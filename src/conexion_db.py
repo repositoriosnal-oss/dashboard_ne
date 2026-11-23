@@ -1663,24 +1663,6 @@ def bootstrap_bono_variables():
                 valores_anteriores JSONB,
                 valores_nuevos JSONB
             );
-            CREATE TABLE IF NOT EXISTS app.bono_periodos_metas (
-                id SERIAL PRIMARY KEY,
-                nombre TEXT NOT NULL,
-                fecha_inicio DATE NOT NULL,
-                fecha_fin DATE,
-                activo BOOLEAN NOT NULL DEFAULT TRUE,
-                creado_por TEXT, creado_en TIMESTAMPTZ DEFAULT now(),
-                actualizado_por TEXT, actualizado_en TIMESTAMPTZ
-            );
-            CREATE TABLE IF NOT EXISTS app.bono_periodos_escala (
-                id SERIAL PRIMARY KEY,
-                nombre TEXT NOT NULL,
-                fecha_inicio DATE NOT NULL,
-                fecha_fin DATE,
-                activo BOOLEAN NOT NULL DEFAULT TRUE,
-                creado_por TEXT, creado_en TIMESTAMPTZ DEFAULT now(),
-                actualizado_por TEXT, actualizado_en TIMESTAMPTZ
-            );
         """))
         c.execute(text("""
             ALTER TABLE app.bono_periodos_metas ADD COLUMN IF NOT EXISTS ambito TEXT NOT NULL DEFAULT 'ALMACEN';
@@ -1783,7 +1765,7 @@ def bootstrap_bono_variables():
 
 @st.cache_data(ttl=300, show_spinner=False)
 def _cargar_config_bono():
-    per = conn.query("SELECT * FROM app.bono_periodos WHERE activo ORDER BY fecha_inicio")
+    per = conn.query("SELECT * FROM app.bono_periodos WHERE activo AND tipo = 'GENERAL' ORDER BY fecha_inicio")
     met = conn.query("SELECT * FROM app.bono_metas_ventas ORDER BY periodo_id, orden")
     esc = conn.query("SELECT * FROM app.bono_escala_rentabilidad ORDER BY periodo_id, orden")
     return per, met, esc
@@ -1843,9 +1825,10 @@ def crear_periodo_metas(nombre, f_ini, f_fin, usuario, ambito="ALMACEN"):
     """Crea un período de tramos de meta en el ámbito indicado (ALMACEN o EJECOM)."""
     with _pg_engine_bono().begin() as c:
         pid = c.execute(text("""
-            INSERT INTO app.bono_periodos_metas (nombre, fecha_inicio, fecha_fin, ambito, creado_por)
-            VALUES (:n, CAST(:fi AS date), CAST(:ff AS date), :amb, :u) RETURNING id
-        """), {"n": nombre, "fi": f_ini, "ff": f_fin, "amb": ambito, "u": usuario}).scalar()
+            INSERT INTO app.bono_periodos (nombre, fecha_inicio, fecha_fin, ambito, tipo, creado_por)
+            VALUES (:n, CAST(:fi AS date), CAST(:ff AS date), :amb, 'METAS', :u) RETURNING id
+        """), {"n": nombre, "fi": f_ini, "ff": f_fin, "amb": ambito, "u": usuario}).scalar()    
+
     _auditar_bono("bono_periodos_metas", pid, "CREATE", None,
                   {"nombre": nombre, "fecha_inicio": str(f_ini), "fecha_fin": str(f_fin),
                    "ambito": ambito})
@@ -2199,8 +2182,9 @@ def crear_periodo(nombre, f_ini, f_fin, factor, base, bloque, pct, metas, escala
         pid = c.execute(text("""
             INSERT INTO app.bono_periodos
                 (nombre, fecha_inicio, fecha_fin, factor_desc_exentas,
-                 meta_adic_base, meta_adic_bloque, meta_adic_pct, creado_por)
-            VALUES (:nom, CAST(:fi AS date), CAST(:ff AS date), :fac, :base, :bloq, :pct, :u)
+                 meta_adic_base, meta_adic_bloque, meta_adic_pct, tipo, ambito, creado_por)
+            VALUES (:nom, CAST(:fi AS date), CAST(:ff AS date), :fac, :base, :bloq, :pct,
+                'GENERAL', 'ALMACEN', :u)
             RETURNING id
         """), {"nom": nombre, "fi": f_ini, "ff": f_fin, "fac": factor,
                "base": base, "bloq": bloque, "pct": pct, "u": usuario}).scalar()
