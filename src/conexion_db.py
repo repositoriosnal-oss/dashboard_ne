@@ -1609,14 +1609,22 @@ def _auditar_bono(tabla, registro_id, accion, antes, despues):
         })
 
 def bootstrap_bono_variables():
-    """Idempotente: crea tablas (fase 1), siembra períodos (fase 2) y audita (fase 3).
-    Cada fase confirma su transacción para evitar problemas de visibilidad entre conexiones."""
+    """
+    Idempotente y seguro. Arquitectura final:
+      · app.bono_periodos = ÚNICO padre, con tipo ('GENERAL'|'METAS'|'ESCALA') y ambito.
+      · app.bono_periodos_metas / _escala = VISTAS filtradas por tipo.
+      · Las hijas (bono_metas_ventas / bono_escala_rentabilidad) conservan su FK a
+        app.bono_periodos(id): con ids únicos globales el FK es válido y no hay colisiones.
+    Fases: 1) DDL  2) semilla  3) auditoría.
+    NUNCA se destruye información: si encuentra el esquema viejo, lo RENOMBRA.
+    """
     eng = _pg_engine_bono()
 
-    # ---------- FASE 1: DDL (se confirma al salir del bloque) ----------
+    # ============================================================
+    # FASE 1: DDL (una sentencia por execute → errores localizables)
+    # ============================================================
     with eng.begin() as c:
-        c.execute(text("DROP VIEW IF EXISTS app.bono_periodos_metas CASCADE;"))
-        c.execute(text("DROP VIEW IF EXISTS app.bono_periodos_escala CASCADE;"))
+        # ---- 1.1 Padre único ----
         c.execute(text("""
             CREATE TABLE IF NOT EXISTS app.bono_periodos (
                 id SERIAL PRIMARY KEY,
@@ -1624,62 +1632,38 @@ def bootstrap_bono_variables():
                 fecha_inicio DATE NOT NULL,
                 fecha_fin DATE,
                 factor_desc_exentas NUMERIC NOT NULL DEFAULT 0.50,
-                meta_adic_base NUMERIC NOT NULL,
-                meta_adic_bloque NUMERIC NOT NULL,
-                meta_adic_pct NUMERIC NOT NULL,
+                meta_adic_base NUMERIC NOT NULL DEFAULT 0,
+                meta_adic_bloque NUMERIC NOT NULL DEFAULT 0,
+                meta_adic_pct NUMERIC NOT NULL DEFAULT 0,
+                tipo TEXT NOT NULL DEFAULT 'GENERAL',
+                ambito TEXT NOT NULL DEFAULT 'ALMACEN',
                 activo BOOLEAN NOT NULL DEFAULT TRUE,
                 creado_por TEXT, creado_en TIMESTAMPTZ DEFAULT now(),
                 actualizado_por TEXT, actualizado_en TIMESTAMPTZ
-            );
+            )
+        """))
+        # Bases que ya existían: se agregan las columnas nuevas (idempotente)
+        c.execute(text("ALTER TABLE app.bono_periodos ADD COLUMN IF NOT EXISTS tipo TEXT NOT NULL DEFAULT 'GENERAL'"))
+        c.execute(text("ALTER TABLE app.bono_periodos ADD COLUMN IF NOT EXISTS ambito TEXT NOT NULL DEFAULT 'ALMACEN'"))
+        c.execute(text("ALTER TABLE app.bono_periodos ADD COLUMN IF NOT EXISTS meta_ejecutivo_mensual NUMERIC NOT NULL DEFAULT 430000000"))
+        c.execute(text("ALTER TABLE app.bono_periodos ADD COLUMN IF NOT EXISTS liquidar_anticipos_mismo_mes BOOLEAN NOT NULL DEFAULT FALSE"))
+        # Los períodos METAS/ESCALA no usan estos campos: necesitan DEFAULT para poder insertarse
+        c.execute(text("ALTER TABLE app.bono_periodos ALTER COLUMN meta_adic_base SET DEFAULT 0"))
+        c.execute(text("ALTER TABLE app.bono_periodos ALTER COLUMN meta_adic_bloque SET DEFAULT 0"))
+        c.execute(text("ALTER TABLE app.bono_periodos ALTER COLUMN meta_adic_pct SET DEFAULT 0"))
+
+        # ---- 1.2 Anticipos (lista de meses cerrados) ----
+        c.execute(text("""
             CREATE TABLE IF NOT EXISTS app.bono_anticipos_periodos (
                 id SERIAL PRIMARY KEY,
-                periodo_mes DATE NOT NULL UNIQUE,   -- primer día del mes (2026-11-01)
+                periodo_mes DATE NOT NULL UNIQUE,
                 liquidar BOOLEAN NOT NULL DEFAULT TRUE,
                 activo BOOLEAN NOT NULL DEFAULT TRUE,
                 creado_por TEXT, creado_en TIMESTAMPTZ DEFAULT now(),
                 actualizado_por TEXT, actualizado_en TIMESTAMPTZ
-            );        
-            CREATE TABLE IF NOT EXISTS app.bono_metas_ventas (
-                id SERIAL PRIMARY KEY,
-                periodo_id INT NOT NULL REFERENCES app.bono_periodos(id) ON DELETE CASCADE,
-                orden INT NOT NULL,
-                umbral_min NUMERIC, min_inclusivo BOOLEAN NOT NULL DEFAULT TRUE,
-                umbral_max NUMERIC, max_inclusivo BOOLEAN NOT NULL DEFAULT FALSE,
-                pct_aplica NUMERIC NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS app.bono_escala_rentabilidad (
-                id SERIAL PRIMARY KEY,
-                periodo_id INT NOT NULL REFERENCES app.bono_periodos(id) ON DELETE CASCADE,
-                orden INT NOT NULL,
-                cond_min NUMERIC, min_inclusivo BOOLEAN NOT NULL DEFAULT FALSE,
-                cond_max NUMERIC, max_inclusivo BOOLEAN NOT NULL DEFAULT FALSE,
-                pct_bono NUMERIC NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS app.bono_auditoria (
-                id SERIAL PRIMARY KEY,
-                tabla TEXT NOT NULL,
-                registro_id INT,
-                accion TEXT NOT NULL,
-                usuario TEXT,
-                momento TIMESTAMPTZ DEFAULT now(),
-                valores_anteriores JSONB,
-                valores_nuevos JSONB
-            );
+            )
         """))
-        c.execute(text("""
-            ALTER TABLE app.bono_periodos_metas ADD COLUMN IF NOT EXISTS ambito TEXT NOT NULL DEFAULT 'ALMACEN';
-            ALTER TABLE app.bono_periodos_escala ADD COLUMN IF NOT EXISTS ambito TEXT NOT NULL DEFAULT 'ALMACEN';
-            ALTER TABLE app.bono_periodos ADD COLUMN IF NOT EXISTS meta_ejecutivo_mensual NUMERIC NOT NULL DEFAULT 430000000;
-            -- 🆕 NUEVO SWITCH
-            ALTER TABLE app.bono_periodos ADD COLUMN IF NOT EXISTS liquidar_anticipos_mismo_mes BOOLEAN NOT NULL DEFAULT FALSE;
-        """))
-        #  Meta individual de ejecutivos comerciales como variable del período
-        c.execute(text("""
-            ALTER TABLE app.bono_periodos
-            ADD COLUMN IF NOT EXISTS meta_ejecutivo_mensual NUMERIC NOT NULL DEFAULT 430000000;
-        """))
-
-             # ---- Migración: esquema viejo (rangos) -> esquema nuevo (lista de meses) ----
+        # Migración del esquema viejo (rangos fecha_inicio/fecha_fin) al nuevo (lista de meses)
         c.execute(text("""
             DO $$
             BEGIN
@@ -1688,7 +1672,7 @@ def bootstrap_bono_variables():
                     WHERE table_schema='app' AND table_name='bono_anticipos_periodos'
                       AND column_name='fecha_inicio'
                 ) THEN
-                    DROP TABLE app.bono_anticipos_periodos;
+                    ALTER TABLE app.bono_anticipos_periodos RENAME TO _legacy_bono_anticipos_periodos;
                     CREATE TABLE app.bono_anticipos_periodos (
                         id SERIAL PRIMARY KEY,
                         periodo_mes DATE NOT NULL UNIQUE,
@@ -1700,69 +1684,178 @@ def bootstrap_bono_variables():
                 END IF;
             END $$;
         """))
-        
-    # ---------- FASE 2: SEMILLA (tablas ya confirmadas y visibles) ----------
+
+        # ---- 1.3 Tablas hijas ----
+        c.execute(text("""
+            CREATE TABLE IF NOT EXISTS app.bono_metas_ventas (
+                id SERIAL PRIMARY KEY,
+                periodo_id INT NOT NULL REFERENCES app.bono_periodos(id) ON DELETE CASCADE,
+                orden INT NOT NULL,
+                umbral_min NUMERIC, min_inclusivo BOOLEAN NOT NULL DEFAULT TRUE,
+                umbral_max NUMERIC, max_inclusivo BOOLEAN NOT NULL DEFAULT FALSE,
+                pct_aplica NUMERIC NOT NULL
+            )
+        """))
+        c.execute(text("""
+            CREATE TABLE IF NOT EXISTS app.bono_escala_rentabilidad (
+                id SERIAL PRIMARY KEY,
+                periodo_id INT NOT NULL REFERENCES app.bono_periodos(id) ON DELETE CASCADE,
+                orden INT NOT NULL,
+                cond_min NUMERIC, min_inclusivo BOOLEAN NOT NULL DEFAULT FALSE,
+                cond_max NUMERIC, max_inclusivo BOOLEAN NOT NULL DEFAULT FALSE,
+                pct_bono NUMERIC NOT NULL
+            )
+        """))
+        c.execute(text("CREATE INDEX IF NOT EXISTS idx_bmv_periodo ON app.bono_metas_ventas (periodo_id, orden)"))
+        c.execute(text("CREATE INDEX IF NOT EXISTS idx_ber_periodo ON app.bono_escala_rentabilidad (periodo_id, orden)"))
+
+        # ---- 1.4 Auditoría ----
+        c.execute(text("""
+            CREATE TABLE IF NOT EXISTS app.bono_auditoria (
+                id SERIAL PRIMARY KEY,
+                tabla TEXT NOT NULL,
+                registro_id INT,
+                accion TEXT NOT NULL,
+                usuario TEXT,
+                momento TIMESTAMPTZ DEFAULT now(),
+                valores_anteriores JSONB,
+                valores_nuevos JSONB
+            )
+        """))
+
+        # ---- 1.5 Si aún existen como TABLAS (esquema viejo), se renombran: no se pierde nada ----
+        c.execute(text("""
+            DO $$
+            DECLARE k CHAR;
+            BEGIN
+                SELECT c.relkind INTO k FROM pg_class c
+                  JOIN pg_namespace n ON n.oid = c.relnamespace
+                 WHERE n.nspname='app' AND c.relname='bono_periodos_metas';
+                IF k = 'r' THEN
+                    ALTER TABLE app.bono_periodos_metas RENAME TO _legacy_bono_periodos_metas;
+                END IF;
+
+                SELECT c.relkind INTO k FROM pg_class c
+                  JOIN pg_namespace n ON n.oid = c.relnamespace
+                 WHERE n.nspname='app' AND c.relname='bono_periodos_escala';
+                IF k = 'r' THEN
+                    ALTER TABLE app.bono_periodos_escala RENAME TO _legacy_bono_periodos_escala;
+                END IF;
+            END $$;
+        """))
+
+        # ---- 1.6 VISTAS (idempotente: CREATE OR REPLACE, sin DROP) ----
+        c.execute(text("""
+            CREATE OR REPLACE VIEW app.bono_periodos_metas AS
+            SELECT id, nombre, fecha_inicio, fecha_fin, activo, ambito,
+                   creado_por, creado_en, actualizado_por, actualizado_en
+            FROM app.bono_periodos
+            WHERE tipo = 'METAS'
+            WITH CASCADED CHECK OPTION
+        """))
+        c.execute(text("""
+            CREATE OR REPLACE VIEW app.bono_periodos_escala AS
+            SELECT id, nombre, fecha_inicio, fecha_fin, activo, ambito,
+                   creado_por, creado_en, actualizado_por, actualizado_en
+            FROM app.bono_periodos
+            WHERE tipo = 'ESCALA'
+            WITH CASCADED CHECK OPTION
+        """))
+
+    # ============================================================
+    # FASE 2: SEMILLA (tablas ya confirmadas y visibles)
+    # ============================================================
     creados = []
     with eng.begin() as c:
-        n = c.execute(text("SELECT COUNT(*) FROM app.bono_periodos")).scalar()
-        if not n:
-            usuario = st.session_state.get("usuario_actual", "bootstrap")
+        usuario = st.session_state.get("usuario_actual", "bootstrap")
+
+        def _nuevo(tipo, ambito, nombre, fi, ff, fac=0.50, base=0, bloq=0, pct=0):
+            return c.execute(text("""
+                INSERT INTO app.bono_periodos
+                    (nombre, fecha_inicio, fecha_fin, factor_desc_exentas,
+                     meta_adic_base, meta_adic_bloque, meta_adic_pct,
+                     tipo, ambito, creado_por)
+                VALUES (:nom, CAST(:fi AS date), CAST(:ff AS date), :fac, :base, :bloq, :pct,
+                        :tipo, :amb, :u)
+                RETURNING id
+            """), {"nom": nombre, "fi": fi, "ff": ff, "fac": fac, "base": base,
+                   "bloq": bloq, "pct": pct, "tipo": tipo, "amb": ambito, "u": usuario}).scalar()
+
+        def _metas(pid, metas):
+            for i, (mn, mi, mx, mxi, p) in enumerate(metas, 1):
+                c.execute(text("""
+                    INSERT INTO app.bono_metas_ventas
+                        (periodo_id, orden, umbral_min, min_inclusivo, umbral_max, max_inclusivo, pct_aplica)
+                    VALUES (:p, :o, :mn, :mi, :mx, :mxi, :pct)
+                """), {"p": pid, "o": i, "mn": mn, "mi": mi, "mx": mx, "mxi": mxi, "pct": p})
+
+        def _escala(pid, escala):
+            for i, (cmn, cmi, cmx, cxi, pb) in enumerate(escala, 1):
+                c.execute(text("""
+                    INSERT INTO app.bono_escala_rentabilidad
+                        (periodo_id, orden, cond_min, min_inclusivo, cond_max, max_inclusivo, pct_bono)
+                    VALUES (:p, :o, :cmn, :cmi, :cmx, :cxi, :pb)
+                """), {"p": pid, "o": i, "cmn": cmn, "cmi": cmi, "cmx": cmx, "cxi": cxi, "pb": pb})
+
+        def _vacio(tipo, ambito=None):
+            if ambito is None:
+                n = c.execute(text("SELECT COUNT(*) FROM app.bono_periodos WHERE tipo=:t"),
+                              {"t": tipo}).scalar()
+            else:
+                n = c.execute(text("SELECT COUNT(*) FROM app.bono_periodos WHERE tipo=:t AND ambito=:a"),
+                              {"t": tipo, "a": ambito}).scalar()
+            return not n
+
+        # ---- 2.1 Períodos GENERALES (parámetros compartidos) ----
+        if _vacio("GENERAL"):
             for (nom, fi, ff, fac, base, bloq, pct, metas) in SEED_PERIODOS:
-                pid = c.execute(text("""
-                    INSERT INTO app.bono_periodos
-                        (nombre, fecha_inicio, fecha_fin, factor_desc_exentas,
-                         meta_adic_base, meta_adic_bloque, meta_adic_pct, creado_por)
-                    VALUES (:nom, CAST(:fi AS date), CAST(:ff AS date), :fac, :base, :bloq, :pct, :u)
-                    RETURNING id
-                """), {"nom": nom, "fi": fi, "ff": ff, "fac": fac,
-                       "base": base, "bloq": bloq, "pct": pct, "u": usuario}).scalar()
-                for i, (mn, mi, mx, mxi, p) in enumerate(metas, 1):
-                    c.execute(text("""
-                        INSERT INTO app.bono_metas_ventas
-                            (periodo_id, orden, umbral_min, min_inclusivo, umbral_max, max_inclusivo, pct_aplica)
-                        VALUES (:p, :o, :mn, :mi, :mx, :mxi, :pct)
-                    """), {"p": pid, "o": i, "mn": mn, "mi": mi, "mx": mx, "mxi": mxi, "pct": p})
-                for i, (cmn, cmi, cmx, cxi, pb) in enumerate(ESCALA_RENT_DEFAULT, 1):
-                    c.execute(text("""
-                        INSERT INTO app.bono_escala_rentabilidad
-                            (periodo_id, orden, cond_min, min_inclusivo, cond_max, max_inclusivo, pct_bono)
-                        VALUES (:p, :o, :cmn, :cmi, :cmx, :cxi, :pb)
-                    """), {"p": pid, "o": i, "cmn": cmn, "cmi": cmi, "cmx": cmx, "cxi": cxi, "pb": pb})
-                creados.append((pid, {"nombre": nom, "fecha_inicio": fi, "fecha_fin": ff}))
+                pid = _nuevo("GENERAL", "ALMACEN", nom, fi, ff, fac, base, bloq, pct)
+                _metas(pid, metas)
+                _escala(pid, ESCALA_RENT_DEFAULT)
+                creados.append((pid, {"nombre": nom, "fecha_inicio": fi, "fecha_fin": ff,
+                                      "tipo": "GENERAL"}))
 
-        n_ej = c.execute(text("SELECT COUNT(*) FROM app.bono_periodos_metas WHERE ambito = 'EJECOM'")).scalar()
-        if not n_ej:
-            for (nom, fi, ff) in (("EJECOM 2025", "2025-01-01", "2025-12-31"), ("EJECOM 2026→", "2026-01-01", None)):
-                pid = c.execute(text("""
-                    INSERT INTO app.bono_periodos_metas (nombre, fecha_inicio, fecha_fin, ambito, creado_por)
-                    VALUES (:n, CAST(:fi AS date), CAST(:ff AS date), 'EJECOM', :u) RETURNING id
-                """), {"n": nom, "fi": fi, "ff": ff, "u": "bootstrap"}).scalar()
-                for i, (mn, mi, mx, mxi, p) in enumerate(METAS_EJECOM_DEFAULT, 1):
-                    c.execute(text("""
-                        INSERT INTO app.bono_metas_ventas
-                            (periodo_id, orden, umbral_min, min_inclusivo, umbral_max, max_inclusivo, pct_aplica)
-                        VALUES (:p, :o, :mn, :mi, :mx, :mxi, :pct)
-                    """), {"p": pid, "o": i, "mn": mn, "mi": mi, "mx": mx, "mxi": mxi, "pct": p})
-        n_eje = c.execute(text("SELECT COUNT(*) FROM app.bono_periodos_escala WHERE ambito = 'EJECOM'")).scalar()
-        if not n_eje:
-            for (nom, fi, ff) in (("EJECOM 2025", "2025-01-01", "2025-12-31"), ("EJECOM 2026→", "2026-01-01", None)):
-                pid = c.execute(text("""
-                    INSERT INTO app.bono_periodos_escala (nombre, fecha_inicio, fecha_fin, ambito, creado_por)
-                    VALUES (:n, CAST(:fi AS date), CAST(:ff AS date), 'EJECOM', :u) RETURNING id
-                """), {"n": nom, "fi": fi, "ff": ff, "u": "bootstrap"}).scalar()
-                for i, (cmn, cmi, cmx, cxi, pb) in enumerate(ESCALA_RENT_DEFAULT, 1):
-                    c.execute(text("""
-                        INSERT INTO app.bono_escala_rentabilidad
-                            (periodo_id, orden, cond_min, min_inclusivo, cond_max, max_inclusivo, pct_bono)
-                        VALUES (:p, :o, :cmn, :cmi, :cmx, :cxi, :pb)
-                    """), {"p": pid, "o": i, "cmn": cmn, "cmi": cmi, "cmx": cmx, "cxi": cxi, "pb": pb})
+        # ---- 2.2 TRAMOS DE META por ámbito (2025 con umbrales de 2025) ----
+        SEM_METAS = {
+            "ALMACEN": [
+                ("Almacenes 2025",          "2025-01-01", "2025-12-31", METAS_2025),
+                ("Almacenes 2026 Ene–Jul",  "2026-01-01", "2026-07-31", METAS_2026),
+                ("Almacenes 2026 Ago→",     "2026-08-01", None,         METAS_2026),
+            ],
+            "EJECOM": [
+                ("EJECOM 2025",             "2025-01-01", "2025-12-31", METAS_EJECOM_DEFAULT),
+                ("EJECOM 2026→",            "2026-01-01", None,         METAS_EJECOM_DEFAULT),
+            ],
+        }
+        for amb, lista in SEM_METAS.items():
+            if _vacio("METAS", amb):
+                for nom, fi, ff, metas in lista:
+                    pid = _nuevo("METAS", amb, nom, fi, ff)
+                    _metas(pid, metas)
+                    creados.append((pid, {"nombre": nom, "tipo": "METAS", "ambito": amb}))
 
-    # ---------- FASE 3: AUDITORÍA post-commit (best-effort, no rompe la semilla) ----------
+        # ---- 2.3 ESCALA DE RENTABILIDAD por ámbito ----
+        SEM_ESC = {
+            "ALMACEN": [("Escala almacenes 2025", "2025-01-01", "2025-12-31"),
+                        ("Escala almacenes 2026→", "2026-01-01", None)],
+            "EJECOM":  [("Escala EJECOM 2025", "2025-01-01", "2025-12-31"),
+                        ("Escala EJECOM 2026→", "2026-01-01", None)],
+        }
+        for amb, lista in SEM_ESC.items():
+            if _vacio("ESCALA", amb):
+                for nom, fi, ff in lista:
+                    pid = _nuevo("ESCALA", amb, nom, fi, ff)
+                    _escala(pid, ESCALA_RENT_DEFAULT)
+                    creados.append((pid, {"nombre": nom, "tipo": "ESCALA", "ambito": amb}))
+
+    # ============================================================
+    # FASE 3: AUDITORÍA post-commit (best-effort)
+    # ============================================================
     for pid, payload in creados:
         try:
             _auditar_bono("bono_periodos", pid, "CREATE_SEED", None, payload)
         except Exception:
-            pass  # la auditoría nunca debe impedir el arranque
+            pass
 
 
 @st.cache_data(ttl=300, show_spinner=False)
@@ -1829,11 +1922,10 @@ def crear_periodo_metas(nombre, f_ini, f_fin, usuario, ambito="ALMACEN"):
         pid = c.execute(text("""
             INSERT INTO app.bono_periodos (nombre, fecha_inicio, fecha_fin, ambito, tipo, creado_por)
             VALUES (:n, CAST(:fi AS date), CAST(:ff AS date), :amb, 'METAS', :u) RETURNING id
-        """), {"n": nombre, "fi": f_ini, "ff": f_fin, "amb": ambito, "u": usuario}).scalar()    
-
+        """), {"n": nombre, "fi": f_ini, "ff": f_fin, "amb": ambito, "u": usuario}).scalar()
     _auditar_bono("bono_periodos_metas", pid, "CREATE", None,
                   {"nombre": nombre, "fecha_inicio": str(f_ini), "fecha_fin": str(f_fin),
-                   "ambito": ambito})
+                   "ambito": ambito, "tipo": "METAS"})
     _cargar_periodos_metas.clear()
     return pid
 
@@ -1842,12 +1934,12 @@ def crear_periodo_escala(nombre, f_ini, f_fin, usuario, ambito="ALMACEN"):
     """Crea un período de escala de rentabilidad en el ámbito indicado."""
     with _pg_engine_bono().begin() as c:
         pid = c.execute(text("""
-            INSERT INTO app.bono_periodos_escala (nombre, fecha_inicio, fecha_fin, ambito, creado_por)
-            VALUES (:n, CAST(:fi AS date), CAST(:ff AS date), :amb, :u) RETURNING id
+            INSERT INTO app.bono_periodos (nombre, fecha_inicio, fecha_fin, ambito, tipo, creado_por)
+            VALUES (:n, CAST(:fi AS date), CAST(:ff AS date), :amb, 'ESCALA', :u) RETURNING id
         """), {"n": nombre, "fi": f_ini, "ff": f_fin, "amb": ambito, "u": usuario}).scalar()
     _auditar_bono("bono_periodos_escala", pid, "CREATE", None,
                   {"nombre": nombre, "fecha_inicio": str(f_ini), "fecha_fin": str(f_fin),
-                   "ambito": ambito})
+                   "ambito": ambito, "tipo": "ESCALA"})
     _cargar_periodos_escala.clear()
     return pid
 
