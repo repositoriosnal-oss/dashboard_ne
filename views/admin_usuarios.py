@@ -5,6 +5,32 @@ from src.conexion_db import conn
 from werkzeug.security import generate_password_hash
 import io
 
+# ==================================================
+# CATÁLOGO ÚNICO DE ROLES Y DEPARTAMENTOS DEL PORTAL
+# (una sola fuente de verdad para las 3 pestañas)
+# ==================================================
+ROLES_PERMITIDOS = [
+    "comercial", "admin_punto", "gerente_comercial", "gerente",
+    "compras", "contabilidad", "talento_humano",
+    "inventarios",   # 🆕 Descuentos de Inventarios (todos los almacenes)
+    "admin",
+]
+DEPARTAMENTOS_PERMITIDOS = [
+    "VENTAS", "COMPRAS", "CONTABILIDAD", "TALENTO_HUMANO",
+    "GERENCIA", "SISTEMAS", "INVENTARIOS",   # 🆕
+]
+ROL_AYUDA = {
+    "comercial": "Ve únicamente sus propios documentos de venta.",
+    "admin_punto": "Opera su almacén/sede asignado (RLS por sede).",
+    "gerente_comercial": "Ve toda el área comercial, sin editar parámetros del bono.",
+    "gerente": "Acceso gerencial completo, incluida la edición del bono.",
+    "compras": "Módulos de compras, rotación e inventarios.",
+    "contabilidad": "Auditoría de descuentos por exentas.",
+    "talento_humano": "Colaboradores, novedades RRHH y distribución.",
+    "inventarios": "Registra, edita y anula descuentos de inventarios en todos los almacenes.",
+    "admin": "Administración total del portal y de usuarios.",
+}
+
 st.set_page_config(page_title="Gestión de Usuarios", layout="wide")
 st.title("👥 Gestión Avanzada de Usuarios")
 st.markdown("---")
@@ -49,16 +75,11 @@ with tab_crear:
     with col1:
         nuevo_usuario = st.text_input("Usuario de Acceso (Ej: juan.perez)").strip().lower()
         nombre_visible = st.text_input("Nombre Completo")
-        rol_seleccionado = st.selectbox(
-            "Rol de Seguridad", 
-            ["comercial", "admin_punto", "gerente_comercial", "gerente", "compras", "contabilidad", "talento_humano", "admin"]
-        )
+        rol_seleccionado = st.selectbox("Rol de Seguridad", ROLES_PERMITIDOS)
+        st.caption(f"ℹ️ {ROL_AYUDA[rol_seleccionado]}")
         
     with col2:
-        depto_seleccionado = st.selectbox(
-            "Departamento", 
-            ["VENTAS", "COMPRAS", "CONTABILIDAD", "TALENTO_HUMANO", "GERENCIA", "SISTEMAS"]
-        )
+        depto_seleccionado = st.selectbox("Departamento", DEPARTAMENTOS_PERMITIDOS)
     
     # ✅ NUEVO: Checkbox para decidir si el usuario debe cambiar la contraseña al entrar
     cambio_forzado_nuevo = st.checkbox(
@@ -140,9 +161,12 @@ with tab_crear:
 # --------------------------------------------------
 with tab_masiva:
     st.subheader("📥 Cargar Usuarios desde Archivo Excel")
+    # 🆕 ACTUALIZACIÓN: Se muestran los roles y departamentos válidos en las instrucciones
     st.info(
         f"💡 **Instrucciones:** El archivo Excel debe tener las columnas: "
         f"`usuario`, `nombre_completo`, `rol`, `departamento`, `sap_branch_code`, `sap_owner_code`. "
+        f"Roles válidos: {', '.join(ROLES_PERMITIDOS)}. "
+        f"Departamentos válidos: {', '.join(DEPARTAMENTOS_PERMITIDOS)}. "
         f"Contraseña asignada: **{default_pwd}**. "
         f"**Todos los usuarios cargados deberán cambiar su contraseña al primer ingreso.**"
     )
@@ -177,6 +201,16 @@ with tab_masiva:
                             usuario = str(row['usuario']).strip().lower()
                             if pd.isna(usuario) or usuario == "":
                                 continue
+                            
+                            # 🆕 VALIDACIÓN DE ROL Y DEPARTAMENTO (Antes del try)
+                            rol_raw = str(row.get('rol', '')).strip().lower()
+                            dep_raw = str(row.get('departamento', '')).strip().upper()
+                            if rol_raw not in ROLES_PERMITIDOS or dep_raw not in DEPARTAMENTOS_PERMITIDOS:
+                                errores += 1
+                                st.caption(f"⚠️ Fila {index + 2}: rol/departamento inválido "
+                                           f"('{rol_raw}' / '{dep_raw}'); se omite.")
+                                continue
+                            
                             try:
                                 branch = str(row.get('sap_branch_code', '')).strip() if pd.notna(row.get('sap_branch_code')) else None
                                 owner = int(row.get('sap_owner_code')) if pd.notna(row.get('sap_owner_code')) and str(row.get('sap_owner_code')).replace('.', '', 1).isdigit() else None
@@ -190,8 +224,8 @@ with tab_masiva:
                                     "usr": usuario,
                                     "cla": generate_password_hash(default_pwd),
                                     "nom": str(row['nombre_completo']).strip(),
-                                    "rol": str(row.get('rol', 'comercial')).strip().lower(),
-                                    "dep": str(row.get('departamento', 'VENTAS')).strip().upper(),
+                                    "rol": rol_raw,   # 🆕 Usamos la variable validada
+                                    "dep": dep_raw,   # 🆕 Usamos la variable validada
                                     "owner": owner,
                                     "branch": branch
                                 })
@@ -200,11 +234,11 @@ with tab_masiva:
                                 errores += 1
                                 continue
                         session.commit()
-                    st.success(f"✅ Proceso finalizado. **{exitos}** usuarios procesados. **{errores}** omitidos (posiblemente duplicados o datos inválidos).")
+                    st.success(f"✅ Proceso finalizado. **{exitos}** usuarios procesados. **{errores}** omitidos (posiblemente duplicados, datos inválidos o roles/departamentos no permitidos).")
                     st.rerun()
         except Exception as e:
             st.error(f"❌ Error al leer el archivo: {e}")
-
+            
 # --------------------------------------------------
 # PESTAÑA 3: CONSULTAR, EDITAR Y BLOQUEAR
 # --------------------------------------------------
@@ -241,13 +275,13 @@ with tab_editar:
             st.markdown("#### Modificar Datos")
             with st.form("form_editar_usuario"):
                 e_nombre = st.text_input("Nombre Completo", value=datos_usr['nombre_completo'])
-                lista_roles = ["comercial", "admin_punto", "gerente_comercial", "gerente", "compras", "contabilidad", "talento_humano", "admin"]
+                lista_roles = ROLES_PERMITIDOS
                 e_rol = st.selectbox(
                     "Rol", 
                     lista_roles, 
                     index=lista_roles.index(datos_usr['rol']) if datos_usr['rol'] in lista_roles else 0
                 )
-                lista_deptos = ["VENTAS", "COMPRAS", "CONTABILIDAD", "TALENTO_HUMANO", "GERENCIA", "SISTEMAS"]
+                lista_deptos = DEPARTAMENTOS_PERMITIDOS
                 e_depto = st.selectbox(
                     "Departamento", 
                     lista_deptos, 

@@ -12,7 +12,7 @@ st.set_page_config(
 # ============================================================
 # 🌐 Ruta pública: indicadores de mercado (sin credenciales)
 #    Debe ir ANTES del control de autenticación.
-#    Link: http://TU_SERVIDOR:8501/?vista=indicadores
+#    Link: http://TU_SERVIDOR:8501/ROLES_INVENTARIOS = ["admin", "gerente", "inventarios", "compras"]
 # ============================================================
 if st.query_params.get("vista") in ("metales", "indicadores"):
     st.navigation([
@@ -157,8 +157,9 @@ if st.session_state["rol_actual"] in ROLES_RRHH_CARGUE:
 if st.session_state["rol_actual"] == "admin":
     estructura_menu["Administración"] = [pag_usuarios]
 
-ROLES_INVENTARIOS = ["admin", "gerente", "inventarios", "compras"]
-if st.session_state["rol_actual"] in ROLES_INVENTARIOS:
+from src.inventarios_descuentos import ROLES_INVENTARIOS_CARGUE
+
+if st.session_state["rol_actual"] in ROLES_INVENTARIOS_CARGUE:
     estructura_menu["Inventarios"] = [pag_inv_descuentos]
 
 navegacion = st.navigation(estructura_menu)
